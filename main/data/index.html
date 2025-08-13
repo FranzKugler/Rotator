@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="de">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AG2998 Rotator Konfiguration</title>
+
+  <!-- Bootswatch Sandstone (incl. Bootstrap CSS) with local fallback -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.0/dist/sandstone/bootstrap.min.css"
+    onerror="this.onerror=null; this.href='/css/bootstrap-sandstone.min.css';">
+  <!-- and some bootstrap icons of cource - with local fallback -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css"
+    onerror="this.onerror=null;this.href='/css/bootstrap-icons.min.css';">
+</head>
+
+<body>
+  <div class="container py-4">
+    <h1 class="mb-4 text-center">AG2998 Rotator</h1>
+
+    <!-- Toast-Container -->
+    <div id="toastContainer" class="toast-container position-fixed top-0 end-0 p-3"></div>
+
+    <!-- Tabs -->
+    <ul class="nav nav-tabs" id="configTabs" role="tablist">
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" id="info-tab" data-bs-toggle="tab" data-bs-target="#info" type="button">Info</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="netzwerk-tab" data-bs-toggle="tab" data-bs-target="#netzwerk" type="button"
+          role="tab">Network</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" id="wlan-tab" data-bs-toggle="tab" data-bs-target="#wlan" type="button"
+          role="tab">WLAN</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" id="kalibrieren-tab" data-bs-toggle="tab" data-bs-target="#kalibrieren" type="button"
+          role="tab">Calibration</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" id="firmware-tab" data-bs-toggle="tab" data-bs-target="#firmware" type="button"
+          role="tab">Firmware</button>
+      </li>
+    </ul>
+
+    <div class="tab-content mt-3">
+
+      <!-- Info Tab -->
+      <div class="tab-pane fade" id="info" role="tabpanel" aria-labelledby="info-tab">
+        <div class="text-start">
+          <svg id="angleGauge" width="300" height="300"></svg>
+        </div>
+        <div class="text-start mt-2">
+          <span>Angle: <strong id="angleVal">0</strong>°</span><br>
+          <span>Mechanical Angle: <strong id="mechVal">0</strong>°</span>
+        </div>
+      </div>
+
+      <!-- Network Tab -->
+      <div class="tab-pane fade show active" id="netzwerk" role="tabpanel">
+        <div class="row g-2 align-items-end">
+          <div class="col-md-4">
+            <label for="ipAddress" class="form-label">IP-Address</label>
+            <input type="text" class="form-control" id="ipAddress" placeholder="192.168.1.100">
+          </div>
+          <div class="col-auto">
+            <button id="setIpBtn" class="btn btn-primary">Set</button>
+          </div>
+        </div>
+        <div class="row g-2 align-items-end mt-3">
+          <div class="col-md-4">
+            <label for="netmask" class="form-label">Netmask</label>
+            <input type="text" class="form-control" id="netmask" placeholder="255.255.255.0">
+          </div>
+          <div class="col-auto">
+            <button id="setNetmaskBtn" class="btn btn-primary">Set</button>
+          </div>
+        </div>
+        <div class="row g-2 align-items-end mt-3">
+          <div class="col-md-4">
+            <label for="macAddress" class="form-label">MAC-Address</label>
+            <input type="text" class="form-control" id="macAddress" placeholder="AA:BB:CC:DD:EE:FF">
+          </div>
+          <div class="col-auto">
+            <button id="setMacBtn" class="btn btn-primary">Set</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- WLAN Tab -->
+      <div class="tab-pane fade" id="wlan" role="tabpanel" aria-labelledby="wlan-tab">
+        <h5>WLAN Connection</h5>
+        <div class="row g-2 align-items-start" style="max-width:700px;">
+          <!-- Scan-Liste -->
+          <div class="col-12">
+            <label class="form-label">Found APs</label>
+            <ul id="apList" class="list-group" style="max-height:200px;overflow:auto;"></ul>
+          </div>
+          <!-- Manuelle SSID / Password / Connect -->
+          <div class="col-7">
+            <input type="text" id="ssidInput" class="form-control" placeholder="input SSID or pick from list">
+          </div>
+          <div class="col-5">
+            <input type="password" id="passInput" class="form-control" placeholder="Password (if needed)">
+          </div>
+          <div class="col-6">
+            <button id="connectBtn" class="btn btn-primary w-100">
+              <i class="bi bi-wifi"></i>Connect</button>
+          </div>
+          <div class="col-6">
+            <button id="scanBtn" class="btn btn-secondary w-100">
+              <i class="bi bi-arrow-repeat"></i> Start Scan
+            </button>
+          </div>
+          <div class="col-12">
+            <div id="wlanStatus" class="mt-2"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Calibration Tab -->
+      <div class="tab-pane fade" id="kalibrieren" role="tabpanel">
+        <div class="d-grid gap-3">
+          <!-- Zero Position -->
+          <div>
+            <button id="findZeroBtn" class="btn btn-primary" style="width: 30%">
+              Find Zero Position
+            </button>
+            <div id="zeroProgress" class="progress mt-2 d-none">
+              <div class="progress-bar bg-primary progress-bar-striped progress-bar-animated text-white text-center"
+                role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="width: 0%;">0%</div>
+            </div>
+            <div id="zeroResult" class="mt-2"></div>
+          </div>
+
+          <!-- Angle Calibration -->
+          <div>
+            <button id="calibrateAngleBtn" class="btn btn-primary" style="width: 30%">
+              Calibrate Rotation Sensor
+            </button>
+            <div id="angleProgress" class="progress mt-2 d-none">
+              <div class="progress-bar bg-primary progress-bar-striped progress-bar-animated text-white text-center"
+                role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="width: 0%;">0%</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Firmware-Tab -->
+      <div class="tab-pane fade" id="firmware" role="tabpanel">
+        <!-- Firmware Update Section -->
+        <div class="mb-5">
+          <h5>Update Firmware</h5>
+          <input type="file" id="fwFileInput" accept=".bin" class="d-none">
+          <div class="row g-2 align-items-end" style="max-width: 700px;">
+            <!-- 7/12 für das Textfeld -->
+            <div class="col-7">
+              <input type="text" id="fwFilePath" class="form-control" placeholder="No file selected" readonly>
+            </div>
+            <!-- 1/12 für den File-Select-Button -->
+            <div class="col-1">
+              <button id="fwFileSelectBtn" class="btn btn-outline-secondary w-80">
+                <i class="bi bi-folder2-open"></i>
+              </button>
+            </div>
+            <!-- 4/12 für den Upload-Button -->
+            <div class="col-4">
+              <button id="uploadFwBtn" class="btn btn-primary w-100">
+                <i class="bi bi-upload"></i> Upload Firmware
+              </button>
+            </div>
+          </div>
+          <div id="fwProgress" class="progress mt-3 d-none" style="width: 50%;">
+            <div class="progress-bar bg-primary progress-bar-striped progress-bar-animated text-white text-center"
+              role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="width: 0%;">0%</div>
+          </div>
+        </div>
+
+        <!-- Filesystem Update Section -->
+        <div class="mb-3">
+          <h5>Update Filesystem</h5>
+          <input type="file" id="fsFileInput" accept=".bin" class="d-none">
+          <div class="row g-2 align-items-end" style="max-width: 700px;">
+            <!-- 7/12 für das Textfeld -->
+            <div class="col-7">
+              <input type="text" id="fsFilePath" class="form-control" placeholder="No file selected" readonly>
+            </div>
+            <!-- 1/12 für den File-Select-Button -->
+            <div class="col-1">
+              <button id="fsFileSelectBtn" class="btn btn-outline-secondary w-80">
+                <i class="bi bi-folder2-open"></i>
+              </button>
+            </div>
+            <!-- 4/12 für den Upload-Button -->
+            <div class="col-4">
+              <button id="uploadFsBtn" class="btn btn-secondary w-100">
+                <i class="bi bi-upload"></i> Upload FS
+              </button>
+            </div>
+          </div>
+          <div id="fsProgress" class="progress mt-3 d-none" style="width: 50%;">
+            <div class="progress-bar bg-primary progress-bar-striped progress-bar-animated text-white text-center"
+              role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="width: 0%;">0%</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Bootstrap Bundle JS mit lokalem Fallback -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"
+    onerror="document.write('<script src=&quot;/js/bootstrap.bundle.min.js&quot;><\\/script>');"></script>
+
+  <!-- Gauge Angle script -->
+  <script src="/js/gauge.js"></script>
+
+  <!-- Custom Script -->
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      // Eingabefelder und Progress-Bars referenzieren
+      const ipInput = document.getElementById('ipAddress');
+      const netmaskInput = document.getElementById('netmask');
+      const macInput = document.getElementById('macAddress');
+      const zeroContainer = document.getElementById('zeroProgress');
+      const zeroBar = zeroContainer?.querySelector('.progress-bar');
+      const angleContainer = document.getElementById('angleProgress');
+      const angleBar = angleContainer?.querySelector('.progress-bar');
+      const toastContainer = document.getElementById('toastContainer');
+
+      // Cache for AP-List and SSID-Input**
+      const ul = document.getElementById('apList');
+      const ssidInput = document.getElementById('ssidInput');
+
+      // Toast-Funktion
+      function showToast(msg) {
+        const toastEl = document.createElement('div');
+        toastEl.className = 'toast align-items-center text-bg-primary border-0';
+        toastEl.setAttribute('role', 'alert');
+        toastEl.setAttribute('aria-live', 'assertive');
+        toastEl.setAttribute('aria-atomic', 'true');
+        toastEl.innerHTML = `
+          <div class="d-flex">
+            <div class="toast-body">${msg}</div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto"
+                    data-bs-dismiss="toast" aria-label="Close"></button>
+          </div>`;
+        toastContainer.appendChild(toastEl);
+        const bsToast = new bootstrap.Toast(toastEl);
+        bsToast.show();
+        toastEl.addEventListener('hidden.bs.toast', () => toastEl.remove());
+      }
+
+      // Helper für POST-Requests
+      function postData(url, body, successMsg, errorMsg) {
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        })
+          .then(resp => {
+            if (resp.ok) showToast(successMsg);
+            else throw new Error('Server error');
+          })
+          .catch(() => showToast(errorMsg));
+      }
+
+      // Network: Werte beim Laden holen
+      fetch('/api/network/config')
+        .then(resp => resp.ok ? resp.json() : Promise.reject())
+        .then(cfg => {
+          ipInput.value = cfg.ip;
+          netmaskInput.value = cfg.netmask;
+          macInput.value = cfg.mac;
+        })
+        .catch(() => showToast('Fehler beim Laden der Konfiguration'));
+
+      document.getElementById('setIpBtn').onclick = () =>
+        postData('/api/network/set/ip', { ip: ipInput.value }, 'IP gesetzt', 'Fehler IP');
+
+      document.getElementById('setNetmaskBtn').onclick = () =>
+        postData('/api/network/set/netmask', { netmask: netmaskInput.value }, 'Netmask gesetzt', 'Fehler Netmask');
+
+      document.getElementById('setMacBtn').onclick = () =>
+        postData('/api/network/set/mac', { mac: macInput.value }, 'MAC gesetzt', 'Fehler MAC');
+
+      // SSE-Stream starten mit defensiven Null-Checks
+      function startStream(path, container, bar, onCompleteEvt, onComplete) {
+        if (!container || !bar) {
+          console.error(`Progress-Container oder -Bar für ${path} nicht gefunden`);
+          return;
+        }
+        bar.style.width = '0%';
+        bar.setAttribute('aria-valuenow', '0');
+        container.classList.remove('d-none');
+
+        const es = new EventSource(path);
+        es.addEventListener('progress', e => {
+          const pct = e.data;
+          bar.style.width = pct + '%';
+          bar.setAttribute('aria-valuenow', pct);
+          bar.textContent = pct + '%';
+        });
+        es.addEventListener(onCompleteEvt, e => {
+          onComplete(e.data);
+          container.classList.add('d-none');
+          es.close();
+        });
+        es.onerror = () => {
+          console.error('SSE-Fehler bei', path);
+          container.classList.add('d-none');
+          es.close();
+        };
+      }
+
+      document.getElementById('findZeroBtn').onclick = () =>
+        startStream('/api/calibration/zero/stream', zeroContainer, zeroBar, 'complete_zero',
+          data => showToast('Zero: ' + data));
+
+      document.getElementById('calibrateAngleBtn').onclick = () =>
+        startStream('/api/calibration/angle/stream', angleContainer, angleBar, 'complete_angle',
+          () => showToast('Sensor calibrated'));
+
+      // Drag & Drop Funktionalitaet
+      ['fw', 'fs'].forEach(prefix => {
+        const filePathInput = document.getElementById(prefix + 'FilePath');
+        const fileInput = document.getElementById(prefix + 'FileInput');
+
+        // Optional: optische Rückmeldung beim Drüberziehen
+        filePathInput.addEventListener('dragenter', e => {
+          e.preventDefault();
+          filePathInput.classList.add('border-primary');
+        });
+        filePathInput.addEventListener('dragleave', e => {
+          e.preventDefault();
+          filePathInput.classList.remove('border-primary');
+        });
+
+        // Erlaubt das Droppen
+        filePathInput.addEventListener('dragover', e => {
+          e.preventDefault();
+        });
+
+        // Wenn eine Datei hereingezogen und losgelassen wird
+        filePathInput.addEventListener('drop', e => {
+          e.preventDefault();
+          filePathInput.classList.remove('border-primary');
+          if (!e.dataTransfer.files.length) return;
+
+          const file = e.dataTransfer.files[0];
+          // DataTransfer erzeugen, um fileInput.files zu befüllen
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          fileInput.files = dt.files;
+
+          // Textfeld mit Dateinamen füllen
+          filePathInput.value = file.name;
+        });
+      });
+
+      // connect button
+      document.getElementById('connectBtn').onclick = () => {
+        const ssid = ssidInput.value;
+        const pass = document.getElementById('passInput').value;
+        if (!ssid) return showToast('Please select / enter SSID');
+        fetch('/api/wifi/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ssid: ssid, password: pass })
+        })
+          .then(r => r.ok ? r.json() : Promise.reject())
+          .then(status => {
+            document.getElementById('wlanStatus').innerHTML =
+              status.connected
+                ? `<span class="text-success">Connected: ${status.ip}</span>`
+                : `<span class="text-danger">Connection failed</span>`;
+            showToast(status.connected ? 'WLAN connected' : 'Connection Error');
+          })
+          .catch(() => showToast('Connection-Request failed'));
+      };
+
+      // scan function
+      function scanForAPs() {
+        fetch('/api/wifi/scan')
+          .then(r => r.ok ? r.json() : Promise.reject())
+          .then(data => {
+            ul.innerHTML = '';
+            const frag = document.createDocumentFragment();
+            data.aps.forEach(ap => {
+              // Signal-Level 0–4
+              const lvl = ap.rssi > -55 ? 4
+                : ap.rssi > -65 ? 3
+                  : ap.rssi > -75 ? 2
+                    : ap.rssi > -85 ? 1 : 0;
+              // Lock-Icon, wenn verschlüsselt (authmode≠0)
+              const secured = ap.authmode !== 0;
+              const li = document.createElement('li');
+              li.className = 'list-group-item list-group-item-action d-flex align-items-center';
+              let iconClass = '';
+              let colorClass = '';
+              switch (lvl) {
+                case 4:
+                  iconClass = 'bi-wifi';
+                  colorClass = 'text-success';
+                  break;
+                case 3:
+                  iconClass = 'bi-wifi';
+                  colorClass = 'text-warning';
+                  break;
+                case 2:
+                  iconClass = 'bi-wifi-2';
+                  colorClass = 'text-warning';
+                  break;
+                case 1:
+                  iconClass = 'bi-wifi-1';
+                  colorClass = 'text-danger';
+                  break;
+                case 0:
+                  iconClass = 'bi-wifi-off';
+                  colorClass = 'text-danger';
+                  break;
+                default:
+                  iconClass = 'bi-question-circle';
+                  colorClass = 'text-muted';
+              }
+              li.innerHTML = `
+                <i class="bi ${iconClass} ${colorClass} me-2"></i>
+                <span class="flex-grow-1">${ap.ssid}</span>
+                ${secured ? '<i class="bi bi-lock-fill text-muted ms-1"></i>' : ''}
+                <small class="text-muted ms-2">(${ap.rssi} dBm)</small>
+              `;
+              li.addEventListener('click', () => {
+                ssidInput.value = ap.ssid;
+              });
+              frag.appendChild(li);
+            });
+            ul.appendChild(frag);
+          })
+          .catch(() => showToast('Scan fehlgeschlagen'));
+      }
+
+      // a) Scan-Button
+      document.getElementById('scanBtn').onclick = scanForAPs;
+
+      // b) Auto-Scan beim Tab sichtbar
+      let scanInterval;
+      const wlanTabEl = document.getElementById('wlan-tab');
+      wlanTabEl.addEventListener('shown.bs.tab', () => {
+        scanForAPs();
+        scanInterval = setInterval(scanForAPs, 5000);
+      });
+      wlanTabEl.addEventListener('hidden.bs.tab', () => {
+        clearInterval(scanInterval);
+      });
+
+
+    });
+
+    // XHR-Upload mit Progress
+    function setupUpload(fileInputId, btnId, url, barId, successMsg, errorMsg) {
+      const input = document.getElementById(fileInputId);
+      const btn = document.getElementById(btnId);
+      const container = document.getElementById(barId);
+      const bar = container.querySelector('.progress-bar');
+
+      btn.addEventListener('click', () => {
+        const file = input.files[0];
+        if (!file) return showToast('Keine Datei ausgewählt');
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.upload.onprogress = e => {
+          if (e.lengthComputable) {
+            const pct = Math.round(e.loaded * 100 / e.total);
+            bar.style.width = pct + '%';
+            bar.setAttribute('aria-valuenow', pct);
+            bar.textContent = pct + '%';
+          }
+        };
+        xhr.onload = () => {
+          container.classList.add('d-none');
+          if (xhr.status === 200) showToast(successMsg);
+          else showToast(errorMsg);
+        };
+        xhr.onerror = () => {
+          container.classList.add('d-none');
+          showToast(errorMsg);
+        };
+        // Reset & start
+        bar.style.width = '0%';
+        bar.setAttribute('aria-valuenow', 0);
+        bar.textContent = '0%';
+        container.classList.remove('d-none');
+        xhr.send(file);
+      });
+    }
+
+    // Datei-Auswahl und Pfad-Anzeige
+    document.getElementById('fwFileSelectBtn').onclick = () =>
+      document.getElementById('fwFileInput').click();
+    document.getElementById('fwFileInput').onchange = () => {
+      const f = document.getElementById('fwFileInput').files[0];
+      document.getElementById('fwFilePath').value = f ? f.name : '';
+    };
+
+    document.getElementById('fsFileSelectBtn').onclick = () =>
+      document.getElementById('fsFileInput').click();
+    document.getElementById('fsFileInput').onchange = () => {
+      const f = document.getElementById('fsFileInput').files[0];
+      document.getElementById('fsFilePath').value = f ? f.name : '';
+    };
+
+    // Firmware- und FS-Upload einrichten
+    setupUpload(
+      'fwFileInput', 'uploadFwBtn', '/update_raw',
+      'fwProgress', 'Firmware updated', 'Firmware-Update failed'
+    );
+    setupUpload(
+      'fsFileInput', 'uploadFsBtn', '/update_fs_raw',
+      'fsProgress', 'Filesystem updated', 'FS-Update failed'
+    );
+
+  </script>
+</body>
+
+</html>

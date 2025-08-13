@@ -1,0 +1,8 @@
+# Name,      Type, SubType, Offset,   Size
+nvs,         data, nvs,     0x9000,   24k
+otadata,     data, ota,     0xf000,   8k
+phy_init,    data, phy,     0x11000,  4k
+factory,     app,  factory, 0x20000,  2M
+ota_0,       app,  ota_0,   ,         2M
+ota_1,       app,  ota_1,   ,         2M
+littlefs,    data, littlefs, ,        10092k
