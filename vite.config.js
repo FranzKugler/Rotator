@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
-const API_ROUTES = ['/api', '/update_raw', '/update_fs_raw'];
+const API_ROUTES = ['/api', '/ota', '/expert'];
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url)));
 let VERSION = process.env.ROTATOR_VERSION;
 if (!VERSION) {

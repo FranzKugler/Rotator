@@ -1,6 +1,16 @@
 // WifiManager.h
 #pragma once
+
 #include "esp_err.h"
-void wifi_manager_init();  // Mount NVS, init WiFi und non-blocking connect
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void wifi_manager_init();
 bool wifi_manager_is_connected();
-const char* wifi_manager_get_ip();
+const char *wifi_manager_get_ip();
+
+#ifdef __cplusplus
+}
+#endif

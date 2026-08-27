@@ -19,6 +19,8 @@ It targets a **Seeed Studio XIAO ESP32-S3 with 16 MB flash**.
 - Browser UI from a LittleFS partition, including live angle updates
 - Wi-Fi station support plus USB RNDIS networking
 - USB CDC logging, FTP access and OTA firmware updates
+- QlockThreeW32-style GitHub update channels (stable/edge), version checks,
+  verified one-click installation, scheduled automatic updates and local image upload
 
 ## Hardware
 

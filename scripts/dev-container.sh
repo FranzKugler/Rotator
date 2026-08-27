@@ -51,6 +51,10 @@ case "${1:-}" in
   build)
     ensure_up
     "${compose[@]}" exec -T dev bash -lc '
+      version="$(git describe --tags --dirty --match "v[0-9]*" 2>/dev/null || printf "0.8.0")"
+      version="${version#v}"
+      export ROTATOR_VERSION="$version"
+      export ROTATOR_BUILD_VERSION_OVERRIDE="$version"
       npm test
       npm run build
       if [[ -f sdkconfig && sdkconfig.defaults -nt sdkconfig ]]; then

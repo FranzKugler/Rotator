@@ -16,6 +16,28 @@ export async function postJson(url, body, fetcher = fetch) {
     : response.text();
 }
 
+export function fetchOtaStatus(fetcher = fetch) {
+  return requestJson('/ota/status', fetcher);
+}
+
+export function checkForUpdate(fetcher = fetch) {
+  return requestJson('/ota/check', fetcher);
+}
+
+export function installUpdate(fetcher = fetch) {
+  return postJson('/ota/install', {}, fetcher);
+}
+
+export function setOtaConfig(config, fetcher = fetch) {
+  return postJson('/ota/config', config, fetcher);
+}
+
+export function fetchExpertStatus(fetcher = fetch) { return requestJson('/expert', fetcher); }
+export function enrollExpert(password, fetcher = fetch) { return postJson('/expert/enroll', { password }, fetcher); }
+export function unlockExpert(password, fetcher = fetch) { return postJson('/expert/unlock', { password }, fetcher); }
+export function lockExpert(fetcher = fetch) { return postJson('/expert/lock', {}, fetcher); }
+export function resetExpert(fetcher = fetch) { return postJson('/expert/reset', {}, fetcher); }
+
 export function connectAngles(onAngle, locationLike = location, Socket = WebSocket) {
   const protocol = locationLike.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new Socket(`${protocol}//${locationLike.host}/api/info/events`);

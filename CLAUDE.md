@@ -94,7 +94,9 @@ changes there as hardware changes, not ordinary refactoring.
   live angles over WebSockets, and exposes network/calibration handlers.
 - [`web/`](web/) is the Svelte 5 source. `npm run build` replaces
   [`main/data/`](main/data/), which ESP-IDF packs into the `littlefs` partition.
-- [`main/OTAUpdate.c`](main/OTAUpdate.c) owns OTA registration.
+- [`main/OTAUpdate.c`](main/OTAUpdate.c) owns manual OTA plus the QlockThreeW32-style
+  stable/edge GitHub release channel, SHA-256 verification, NVS settings and the
+  02:00–05:00 Europe/Berlin automatic-update window.
 
 When changing an API consumed by the browser, update the firmware handler,
 `web/src/lib/api.js`, the matching Svelte section, Vite's proxy list and tests.

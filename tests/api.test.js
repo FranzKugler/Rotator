@@ -1,5 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
-import { connectAngles, postJson, uploadImage } from '../web/src/lib/api.js';
+import {
+  checkForUpdate,
+  connectAngles,
+  enrollExpert,
+  fetchExpertStatus,
+  fetchOtaStatus,
+  installUpdate,
+  lockExpert,
+  postJson,
+  setOtaConfig,
+  unlockExpert,
+  uploadImage
+} from '../web/src/lib/api.js';
 
 describe('postJson', () => {
   it('posts JSON and returns a JSON response', async () => {
@@ -54,8 +66,57 @@ describe('uploadImage', () => {
       }
     }
     const progress = vi.fn();
-    await uploadImage('/update_raw', 'binary', progress, FakeXHR);
-    expect([xhr.method, xhr.url, xhr.body]).toEqual(['POST', '/update_raw', 'binary']);
+    await uploadImage('/ota/upload', 'binary', progress, FakeXHR);
+    expect([xhr.method, xhr.url, xhr.body]).toEqual(['POST', '/ota/upload', 'binary']);
     expect(progress).toHaveBeenCalledWith(50);
+  });
+});
+
+describe('OTA release channel API', () => {
+  it('loads status and checks the selected GitHub channel', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ firmwareVersion: '0.8.0' }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ availableVersion: '0.9.0' }) });
+
+    await expect(fetchOtaStatus(fetcher)).resolves.toEqual({ firmwareVersion: '0.8.0' });
+    await expect(checkForUpdate(fetcher)).resolves.toEqual({ availableVersion: '0.9.0' });
+    expect(fetcher).toHaveBeenNthCalledWith(1, '/ota/status');
+    expect(fetcher).toHaveBeenNthCalledWith(2, '/ota/check');
+  });
+
+  it('installs an update and persists channel configuration', async () => {
+    const fetcher = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ state: 'downloading' })
+    });
+
+    await installUpdate(fetcher);
+    await setOtaConfig({ channel: 1, autoUpdate: true, checkInterval: 24 }, fetcher);
+    expect(fetcher).toHaveBeenNthCalledWith(1, '/ota/install', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    expect(fetcher).toHaveBeenNthCalledWith(2, '/ota/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel: 1, autoUpdate: true, checkInterval: 24 })
+    });
+  });
+});
+
+describe('expert update lock API', () => {
+  it('loads, enrolls, unlocks and locks expert mode', async () => {
+    const fetcher = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ unlocked: true })
+    });
+    await fetchExpertStatus(fetcher);
+    await enrollExpert('secret12', fetcher);
+    await unlockExpert('secret12', fetcher);
+    await lockExpert(fetcher);
+    expect(fetcher.mock.calls.map((call) => call[0])).toEqual([
+      '/expert', '/expert/enroll', '/expert/unlock', '/expert/lock'
+    ]);
   });
 });

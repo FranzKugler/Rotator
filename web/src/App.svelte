@@ -1,7 +1,8 @@
 <script>
   import { onMount } from 'svelte';
   import AngleGauge from './lib/AngleGauge.svelte';
-  import { calibrationStream, connectAngles, postJson, requestJson, uploadImage } from './lib/api.js';
+  import Firmware from './sections/Firmware.svelte';
+  import { calibrationStream, connectAngles, postJson, requestJson } from './lib/api.js';
 
   const VERSION = __ROTATOR_VERSION__;
 
@@ -20,10 +21,6 @@
   let scanBusy = $state(false);
   let zeroProgress = $state(null);
   let angleProgress = $state(null);
-  let firmwareFile = $state(null);
-  let filesystemFile = $state(null);
-  let firmwareProgress = $state(null);
-  let filesystemProgress = $state(null);
 
   function announce(message, failed = false) {
     notice = message;
@@ -73,21 +70,6 @@
         announce('Calibration connection closed', true);
       }
     });
-  }
-
-  async function upload(kind) {
-    const firmware = kind === 'firmware';
-    const file = firmware ? firmwareFile : filesystemFile;
-    if (!file) return announce('Select a binary image first', true);
-    if (firmware) firmwareProgress = 0; else filesystemProgress = 0;
-    try {
-      await uploadImage(firmware ? '/update_raw' : '/update_fs_raw', file,
-        value => firmware ? firmwareProgress = value : filesystemProgress = value);
-      announce(`${firmware ? 'Firmware' : 'Filesystem'} accepted; the rotator will restart`);
-    } catch (reason) { announce(`Upload failed: ${reason.message}`, true); }
-    finally {
-      if (firmware) firmwareProgress = null; else filesystemProgress = null;
-    }
   }
 
   onMount(() => {
@@ -155,12 +137,7 @@
       </div>
     </section>
   {:else}
-    <section><p class="eyebrow">Maintenance</p><h1>Install images</h1><p class="intro warning">An update writes flash and restarts the rotator. Keep power and the network connection stable.</p>
-      <div class="cards">
-        <article><span class="number">FW</span><h2>Firmware</h2><p>Upload the ESP-IDF application image <code>Rotator.bin</code>.</p><label class="file">{firmwareFile?.name || 'Choose firmware image'}<input type="file" accept=".bin" onchange={(event) => firmwareFile = event.currentTarget.files[0]} /></label><button onclick={() => upload('firmware')}>Upload firmware</button>{#if firmwareProgress !== null}<progress max="100" value={firmwareProgress}></progress>{/if}</article>
-        <article><span class="number">FS</span><h2>Web filesystem</h2><p>Upload <code>littlefs.bin</code>, including this interface.</p><label class="file">{filesystemFile?.name || 'Choose filesystem image'}<input type="file" accept=".bin" onchange={(event) => filesystemFile = event.currentTarget.files[0]} /></label><button onclick={() => upload('filesystem')}>Upload filesystem</button>{#if filesystemProgress !== null}<progress max="100" value={filesystemProgress}></progress>{/if}</article>
-      </div>
-    </section>
+    <Firmware />
   {/if}
 </main>
 

@@ -32,9 +32,15 @@ extern "C"
 #include "WifiManager.h"
 #include "RotatorApi.h"
 #include "RotatorHW.h"
+#include "ExpertLock.h"
 
 static const char *TAG = "main";
 //QueueHandle_t angleUpdateQueue = nullptr;
+
+extern "C" size_t rotator_get_sketch_size(void)
+{
+    return ESP.getSketchSize();
+}
 
 
 // the port of the Alpaca Server
@@ -132,6 +138,8 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));
 
     // 8) Over the Air Update registration
+    expert_lock_init();
+    expert_lock_register_routes(server);
     register_ota_update_uri(server);
 
     // 9) Device and Alpaca Server

@@ -3,13 +3,17 @@
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 static const char *TAG = "wifi_mgr";
 static bool s_connected = false;
 static char s_ipstr[16] = "";
+static bool s_sntp_started = false;
 
 
 static void on_wifi_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
@@ -26,6 +30,13 @@ static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data
     esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &info);
     snprintf(s_ipstr, sizeof(s_ipstr), IPSTR, IP2STR(&info.ip));
     s_connected = true;
+    if (!s_sntp_started) {
+      // Rotator's automatic-update night window follows local Munich time.
+      setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+      tzset();
+      esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+      if (esp_netif_sntp_init(&sntp) == ESP_OK) s_sntp_started = true;
+    }
     ESP_LOGI(TAG, "Got IP: %s", s_ipstr);
   }
 }
