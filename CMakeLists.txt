@@ -18,6 +18,7 @@ else()
     set(ROTATOR_BUILD_VERSION "0.8.0")
 endif()
 add_compile_definitions(ROTATOR_VERSION="${ROTATOR_BUILD_VERSION}")
+set(PROJECT_VER "${ROTATOR_BUILD_VERSION}")
 file(WRITE "${CMAKE_BINARY_DIR}/version.txt" "${ROTATOR_BUILD_VERSION}\n")
 message(STATUS "Rotator version: ${ROTATOR_BUILD_VERSION}")
 

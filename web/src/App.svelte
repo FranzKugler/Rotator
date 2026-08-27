@@ -85,6 +85,9 @@
         value => firmware ? firmwareProgress = value : filesystemProgress = value);
       announce(`${firmware ? 'Firmware' : 'Filesystem'} accepted; the rotator will restart`);
     } catch (reason) { announce(`Upload failed: ${reason.message}`, true); }
+    finally {
+      if (firmware) firmwareProgress = null; else filesystemProgress = null;
+    }
   }
 
   onMount(() => {

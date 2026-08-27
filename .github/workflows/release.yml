@@ -18,17 +18,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Build ESP-IDF project
-        uses: espressif/esp-idf-ci-action@v1
+        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
         with:
           esp_idf_version: v5.4.1
           target: esp32s3
@@ -40,6 +40,10 @@ jobs:
         run: |
           version="$(cat build/version.txt)"
           if [ "${{ github.ref_type }}" = "tag" ]; then
+            case "${{ github.ref_name }}" in
+              v[0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "Invalid release tag: ${{ github.ref_name }}" >&2; exit 1 ;;
+            esac
             echo "channel=stable" >> "$GITHUB_OUTPUT"
             echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           else
@@ -55,7 +59,7 @@ jobs:
         run: npm ci && npm test && npm run build
 
       - name: Rebuild filesystem image
-        uses: espressif/esp-idf-ci-action@v1
+        uses: espressif/esp-idf-ci-action@e6f5c74232b1ccd4c97ed641f1e48553853f1fd5 # v1.2.0
         with:
           esp_idf_version: v5.4.1
           target: esp32s3

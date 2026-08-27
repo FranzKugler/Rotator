@@ -38,7 +38,7 @@ export default defineConfig({
     host: '0.0.0.0',
     proxy: Object.fromEntries(API_ROUTES.map((route) => [route, 'http://localhost:8080']))
   },
-  cacheDir: '/home/developer/.cache/vite',
+  cacheDir: process.env.HOME ? `${process.env.HOME}/.cache/rotator-vite` : '../.vite-cache',
   test: {
     include: ['../tests/**/*.test.js']
   }
