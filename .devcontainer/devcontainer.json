@@ -1,0 +1,20 @@
+{
+  "name": "Rotator ESP-IDF",
+  "dockerComposeFile": "compose.yaml",
+  "service": "dev",
+  "workspaceFolder": "/workspace",
+  "shutdownAction": "stopCompose",
+  "remoteUser": "developer",
+  "forwardPorts": [5173],
+  "portsAttributes": {
+    "5173": { "label": "Svelte web UI" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "espressif.esp-idf-extension",
+        "ms-vscode.cpptools"
+      ]
+    }
+  }
+}

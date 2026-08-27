@@ -1,0 +1,10 @@
+.git
+.github
+build
+managed_components
+node_modules
+sdkconfig
+sdkconfig.old
+dependencies.lock
+.claude
+.env

@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build ESP-IDF project
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.1
+          target: esp32s3
+          path: .
+          command: idf.py build
+
+      - name: Work out version and channel
+        id: meta
+        run: |
+          version="$(cat build/version.txt)"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=edge" >> "$GITHUB_OUTPUT"
+            echo "tag=edge" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version $version"
+
+      - name: Build web interface with the firmware version
+        env:
+          ROTATOR_VERSION: ${{ steps.meta.outputs.version }}
+        run: npm ci && npm test && npm run build
+
+      - name: Rebuild filesystem image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.1
+          target: esp32s3
+          path: .
+          command: idf.py build
+
+      - name: Write release manifest
+        run: |
+          notes="$(git log -1 --pretty=%s)"
+          python3 scripts/manifest.py \
+            --channel "${{ steps.meta.outputs.channel }}" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --notes "$notes" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}" \
+            --out manifest.json \
+            build/Rotator.bin build/littlefs.bin
+
+      - name: Publish edge release
+        if: steps.meta.outputs.channel == 'edge'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          Rolling build of the latest commit on `main`, replaced on every push.
+          This channel is untested; use the latest stable release for normal operation.
+
+          | | |
+          |---|---|
+          | Version | `${{ steps.meta.outputs.version }}` |
+          | Commit | ${{ github.sha }} |
+
+          `Rotator.bin` is the firmware and `littlefs.bin` the browser interface.
+          EOF
+          gh release delete edge --yes --cleanup-tag || true
+          gh release create edge \
+            --prerelease \
+            --title "Edge build ${{ steps.meta.outputs.version }}" \
+            --notes-file notes.md \
+            build/Rotator.bin build/littlefs.bin manifest.json
+
+      - name: Publish stable release
+        if: steps.meta.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --generate-notes \
+            build/Rotator.bin build/littlefs.bin manifest.json
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ steps.meta.outputs.channel }} ${{ steps.meta.outputs.version }}"
+            echo
+            echo '```json'
+            cat manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

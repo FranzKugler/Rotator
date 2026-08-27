@@ -1,0 +1,39 @@
+name: rotator-dev
+
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+      args:
+        DEV_UID: "${DEV_UID:-1000}"
+        DEV_GID: "${DEV_GID:-1000}"
+        CLAUDE_CODE_VERSION: "2.1.247"
+    image: rotator-dev:local
+    init: true
+    working_dir: /workspace
+    command: sleep infinity
+    volumes:
+      - ..:/workspace
+      - idf-cache:/home/developer/.cache/ccache
+      - npm-cache:/home/developer/.npm
+      - node-modules-v1:/home/developer/node_modules
+      - claude-state:/home/developer/.claude
+    ports:
+      - "127.0.0.1:5174:5173"
+    environment:
+      HOME: /home/developer
+      NODE_PATH: /home/developer/node_modules
+      IDF_CCACHE_ENABLE: "1"
+      CCACHE_DIR: /home/developer/.cache/ccache
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 1024
+
+volumes:
+  idf-cache:
+  npm-cache:
+  node-modules-v1:
+  claude-state:

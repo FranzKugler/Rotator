@@ -3,10 +3,9 @@
 #define ROTATOR_API_H
 
 #include "RotatorHW.h"
+#include "Version.h"
 #include "alpaca_server/api.h"
 #include "alpaca_server/discovery.h"
-
-#define ROTATOR_VERSION "1.0.1"
 
 class RotatorApi : public AlpacaServer::Rotator
 {

@@ -1,0 +1,16 @@
+# ESP-IDF generated state
+/build/
+/sdkconfig
+/sdkconfig.old
+/dependencies.lock
+/managed_components/
+/node_modules/
+
+# Editors and local agent state
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# Operating-system files
+.DS_Store
+Thumbs.db
