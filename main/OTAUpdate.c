@@ -13,6 +13,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "esp_tls.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
 
@@ -32,7 +33,11 @@
 #define OTA_HTTP_TIMEOUT_MS 20000
 #define OTA_TASK_STACK 12288
 #define OTA_MAX_REDIRECTS 5
-#define OTA_LOCATION_BUF 1024
+// GitHub release-asset redirects terminate on objects.githubusercontent.com
+// with an AWS-signed query string that regularly exceeds 1024 bytes; a
+// too-small buffer here used to silently truncate the Location header and
+// send the next hop a corrupted URL instead of failing loudly.
+#define OTA_LOCATION_BUF 2048
 
 static const char *TAG = "OTAUpdate";
 extern void ConfigurationSave(void);
@@ -245,42 +250,35 @@ static esp_err_t send_status(httpd_req_t *req)
     return result;
 }
 
-typedef struct {
-    char *data;
-    size_t length;
-    size_t capacity;
-} response_buffer_t;
-
 // ESP-IDF 5.4's esp_http_client appends each hop's Location header to the
 // previous one instead of replacing it, so its own automatic-redirect
 // following silently builds a corrupt URL across GitHub's release-asset
-// redirect chain. Redirects are
-// therefore disabled and followed by hand: this buffer is app-owned, cleared
-// before every request, and holds only the Location header of the response
-// that was just received.
+// redirect chain. Redirects are therefore disabled and followed by hand:
+// this buffer is app-owned, cleared before every request, and holds only
+// the Location header of the response that was just received.
+//
+// Both callers read the response body themselves via esp_http_client_read()
+// rather than through esp_http_client_perform(): GitHub's redirect hops send
+// "Content-Length: 0", and esp_http_client_fetch_headers() mistakenly treats
+// any content_length <= 0 as chunked encoding, so perform()'s automatic body
+// drain then blocks trying to read chunk-framed data a plain empty response
+// never sends. Never draining a body between hops sidesteps that entirely.
 typedef struct {
     char location[OTA_LOCATION_BUF];
-    response_buffer_t *body; // NULL when the caller reads the body itself
+    bool location_truncated; // Location header did not fit; never follow it
+    int tls_code;            // last esp-tls error captured on HTTP_EVENT_ERROR
+    int tls_flags;           // last mbedtls X.509 verify flags, if any
 } ota_http_ctx_t;
 
 static esp_err_t ota_http_event_handler(esp_http_client_event_t *event)
 {
     ota_http_ctx_t *ctx = event->user_data;
     if (event->event_id == HTTP_EVENT_ON_HEADER && strcasecmp(event->header_key, "Location") == 0) {
-        snprintf(ctx->location, sizeof(ctx->location), "%s", event->header_value ? event->header_value : "");
-    } else if (event->event_id == HTTP_EVENT_ON_DATA && ctx->body && event->data && event->data_len > 0) {
-        response_buffer_t *buffer = ctx->body;
-        size_t needed = buffer->length + event->data_len + 1;
-        if (needed > buffer->capacity) {
-            size_t capacity = needed * 2;
-            char *grown = realloc(buffer->data, capacity);
-            if (!grown) return ESP_ERR_NO_MEM;
-            buffer->data = grown;
-            buffer->capacity = capacity;
-        }
-        memcpy(buffer->data + buffer->length, event->data, event->data_len);
-        buffer->length += event->data_len;
-        buffer->data[buffer->length] = 0;
+        const char *value = event->header_value ? event->header_value : "";
+        int written = snprintf(ctx->location, sizeof(ctx->location), "%s", value);
+        ctx->location_truncated = written < 0 || (size_t)written >= sizeof(ctx->location);
+    } else if (event->event_id == HTTP_EVENT_ERROR && event->data) {
+        esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)event->data, &ctx->tls_code, &ctx->tls_flags);
     }
     return ESP_OK;
 }
@@ -293,42 +291,76 @@ static bool fetch_manifest(void)
     }
     s_state = OTA_CHECKING;
     clear_error();
-    response_buffer_t body = {0};
-    ota_http_ctx_t ctx = {.body = &body};
+    ota_http_ctx_t ctx = {0};
     esp_http_client_config_t config = {
         .url = s_channel == 1 ? OTA_MANIFEST_EDGE : OTA_MANIFEST_STABLE,
         .event_handler = ota_http_event_handler,
         .user_data = &ctx,
         .timeout_ms = OTA_HTTP_TIMEOUT_MS,
         .buffer_size = 16384,
+        // GitHub sometimes redirects straight to the long S3-signed asset
+        // URL (900+ bytes) instead of via a short intermediate github.com hop;
+        // esp_http_client's default 512-byte TX buffer is too small to build
+        // that request line, and fails with a bare ESP_FAIL and no event.
+        .buffer_size_tx = 4096,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = "Rotator/" ROTATOR_VERSION,
         .disable_auto_redirect = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_err_t error = client ? ESP_OK : ESP_ERR_NO_MEM;
-    int status = 0;
-    for (int redirects = 0; client && error == ESP_OK; ++redirects) {
+    const char *stage = "open";
+    esp_err_t error = client ? esp_http_client_open(client, 0) : ESP_ERR_NO_MEM;
+    if (error == ESP_OK) esp_http_client_fetch_headers(client);
+    for (int redirects = 0; error == ESP_OK && redirects < OTA_MAX_REDIRECTS; ++redirects) {
+        int status = esp_http_client_get_status_code(client);
+        if (status < 300 || status >= 400 || !ctx.location[0]) break;
+        if (ctx.location_truncated) { error = ESP_ERR_INVALID_SIZE; stage = "location"; break; }
+        char location[OTA_LOCATION_BUF];
+        snprintf(location, sizeof(location), "%s", ctx.location);
         ctx.location[0] = 0;
-        body.length = 0;
-        if (body.data) body.data[0] = 0;
-        error = esp_http_client_perform(client);
-        status = esp_http_client_get_status_code(client);
-        if (error != ESP_OK || status < 300 || status >= 400 || !ctx.location[0]) break;
-        if (redirects >= OTA_MAX_REDIRECTS) { error = ESP_FAIL; break; }
-        esp_http_client_set_url(client, ctx.location);
+        esp_http_client_close(client);
+        error = esp_http_client_set_url(client, location);
+        if (error != ESP_OK) { stage = "set_url"; break; }
+        error = esp_http_client_open(client, 0);
+        if (error != ESP_OK) { stage = "reopen"; break; }
+        stage = "fetch_headers";
+        esp_http_client_fetch_headers(client);
+    }
+    int status = client ? esp_http_client_get_status_code(client) : 0;
+    char *body = NULL;
+    if (error == ESP_OK && status == 200) {
+        stage = "content_length";
+        int64_t length = esp_http_client_get_content_length(client);
+        if (length > 0 && length < 16384) {
+            body = malloc((size_t)length + 1);
+            if (!body) {
+                error = ESP_ERR_NO_MEM;
+            } else {
+                stage = "read";
+                int64_t total = 0;
+                while (total < length) {
+                    int read = esp_http_client_read(client, body + total, (int)(length - total));
+                    if (read <= 0) { error = ESP_FAIL; break; }
+                    total += read;
+                }
+                body[total] = 0;
+            }
+        } else {
+            error = ESP_ERR_INVALID_SIZE;
+        }
     }
     if (client) esp_http_client_cleanup(client);
     if (error != ESP_OK || status != 200) {
-        char detail[64];
-        snprintf(detail, sizeof(detail), "HTTP %d / %s", status, esp_err_to_name(error));
-        free(body.data);
+        char detail[96];
+        snprintf(detail, sizeof(detail), "HTTP %d / %s @ %s / tls 0x%x flags 0x%x",
+                 status, esp_err_to_name(error), stage, ctx.tls_code, ctx.tls_flags);
+        free(body);
         set_error("otaManifestHttp", detail);
         return false;
     }
 
-    cJSON *root = cJSON_Parse(body.data ? body.data : "");
-    free(body.data);
+    cJSON *root = cJSON_Parse(body ? body : "");
+    free(body);
     if (!root) {
         set_error("otaManifestParse", "Invalid JSON");
         return false;
@@ -447,6 +479,11 @@ static esp_err_t stream_to_partition(const char *url, const char *expected_sha, 
         .user_data = &ctx,
         .timeout_ms = OTA_HTTP_TIMEOUT_MS,
         .buffer_size = 16384,
+        // GitHub sometimes redirects straight to the long S3-signed asset
+        // URL (900+ bytes) instead of via a short intermediate github.com hop;
+        // esp_http_client's default 512-byte TX buffer is too small to build
+        // that request line, and fails with a bare ESP_FAIL and no event.
+        .buffer_size_tx = 4096,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = "Rotator/" ROTATOR_VERSION,
         .disable_auto_redirect = true,
@@ -457,20 +494,25 @@ static esp_err_t stream_to_partition(const char *url, const char *expected_sha, 
         return ESP_FAIL;
     }
     esp_http_client_fetch_headers(client);
+    esp_err_t redirect_error = ESP_OK;
     for (int redirects = 0; redirects < OTA_MAX_REDIRECTS; ++redirects) {
         int status = esp_http_client_get_status_code(client);
         if (status < 300 || status >= 400 || !ctx.location[0]) break;
+        if (ctx.location_truncated) { redirect_error = ESP_ERR_INVALID_SIZE; break; }
         char location[OTA_LOCATION_BUF];
         snprintf(location, sizeof(location), "%s", ctx.location);
         ctx.location[0] = 0;
-        esp_http_client_set_url(client, location);
+        ctx.location_truncated = false;
         esp_http_client_close(client);
-        if (esp_http_client_open(client, 0) != ESP_OK) break;
+        redirect_error = esp_http_client_set_url(client, location);
+        if (redirect_error != ESP_OK) break;
+        redirect_error = esp_http_client_open(client, 0);
+        if (redirect_error != ESP_OK) break;
         esp_http_client_fetch_headers(client);
     }
-    if (esp_http_client_get_status_code(client) != 200) {
+    if (redirect_error != ESP_OK || esp_http_client_get_status_code(client) != 200) {
         esp_http_client_cleanup(client);
-        return ESP_FAIL;
+        return redirect_error != ESP_OK ? redirect_error : ESP_FAIL;
     }
 
     esp_ota_handle_t ota_handle = 0;
