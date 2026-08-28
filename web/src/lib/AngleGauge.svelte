@@ -36,11 +36,11 @@
 
 <style>
   svg { width: min(100%, 22rem); filter: drop-shadow(0 18px 32px rgb(0 0 0 / .28)); }
-  .face { fill: #111923; stroke: #34475a; stroke-width: 2; }
-  line { stroke: #60768b; stroke-width: 1.5; }
-  line.major { stroke: #dce8f2; stroke-width: 2.5; }
-  text { fill: #91a4b6; text-anchor: middle; font: 600 13px system-ui; }
-  .sweep { fill: none; stroke: #21d4b4; stroke-width: 1; stroke-dasharray: 3 8; opacity: .42; }
-  .pointer { stroke: #ff7a4d; stroke-width: 4; stroke-linecap: round; }
-  .hub { fill: #ff7a4d; stroke: #ffd3c4; stroke-width: 2; }
+  .face { fill: #251a3c; stroke: #79628c; stroke-width: 2; }
+  line { stroke: #79628c; stroke-width: 1.5; }
+  line.major { stroke: #fff; stroke-width: 2.5; }
+  text { fill: #c7bfd2; text-anchor: middle; font: 600 13px Rubik, system-ui; }
+  .sweep { fill: none; stroke: #e34b4b; stroke-width: 1; stroke-dasharray: 3 8; opacity: .58; }
+  .pointer { stroke: #e34b4b; stroke-width: 4; stroke-linecap: round; }
+  .hub { fill: #e34b4b; stroke: #ffc1c1; stroke-width: 2; }
 </style>

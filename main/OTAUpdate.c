@@ -31,6 +31,8 @@
 #define OTA_AUTO_HOUR_TO 5
 #define OTA_HTTP_TIMEOUT_MS 20000
 #define OTA_TASK_STACK 12288
+#define OTA_MAX_REDIRECTS 5
+#define OTA_LOCATION_BUF 1024
 
 static const char *TAG = "OTAUpdate";
 extern void ConfigurationSave(void);
@@ -150,15 +152,17 @@ static void load_config(void)
     s_check_interval = interval;
 }
 
-static void save_config(void)
+static bool save_config(void)
 {
     nvs_handle_t nvs;
-    if (nvs_open(OTA_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
-    nvs_set_i8(nvs, "channel", s_channel);
-    nvs_set_u8(nvs, "auto", s_auto_update ? 1 : 0);
-    nvs_set_u16(nvs, "interval", s_check_interval);
-    nvs_commit(nvs);
+    esp_err_t error = nvs_open(OTA_NAMESPACE, NVS_READWRITE, &nvs);
+    if (error != ESP_OK) return false;
+    if (error == ESP_OK) error = nvs_set_i8(nvs, "channel", s_channel);
+    if (error == ESP_OK) error = nvs_set_u8(nvs, "auto", s_auto_update ? 1 : 0);
+    if (error == ESP_OK) error = nvs_set_u16(nvs, "interval", s_check_interval);
+    if (error == ESP_OK) error = nvs_commit(nvs);
     nvs_close(nvs);
+    return error == ESP_OK;
 }
 
 static void read_fs_version(void)
@@ -247,21 +251,37 @@ typedef struct {
     size_t capacity;
 } response_buffer_t;
 
-static esp_err_t collect_http_data(esp_http_client_event_t *event)
+// ESP-IDF 5.4's esp_http_client appends each hop's Location header to the
+// previous one instead of replacing it, so its own automatic-redirect
+// following silently builds a corrupt URL across GitHub's release-asset
+// redirect chain. Redirects are
+// therefore disabled and followed by hand: this buffer is app-owned, cleared
+// before every request, and holds only the Location header of the response
+// that was just received.
+typedef struct {
+    char location[OTA_LOCATION_BUF];
+    response_buffer_t *body; // NULL when the caller reads the body itself
+} ota_http_ctx_t;
+
+static esp_err_t ota_http_event_handler(esp_http_client_event_t *event)
 {
-    if (event->event_id != HTTP_EVENT_ON_DATA || !event->data || event->data_len <= 0) return ESP_OK;
-    response_buffer_t *buffer = event->user_data;
-    size_t needed = buffer->length + event->data_len + 1;
-    if (needed > buffer->capacity) {
-        size_t capacity = needed * 2;
-        char *grown = realloc(buffer->data, capacity);
-        if (!grown) return ESP_ERR_NO_MEM;
-        buffer->data = grown;
-        buffer->capacity = capacity;
+    ota_http_ctx_t *ctx = event->user_data;
+    if (event->event_id == HTTP_EVENT_ON_HEADER && strcasecmp(event->header_key, "Location") == 0) {
+        snprintf(ctx->location, sizeof(ctx->location), "%s", event->header_value ? event->header_value : "");
+    } else if (event->event_id == HTTP_EVENT_ON_DATA && ctx->body && event->data && event->data_len > 0) {
+        response_buffer_t *buffer = ctx->body;
+        size_t needed = buffer->length + event->data_len + 1;
+        if (needed > buffer->capacity) {
+            size_t capacity = needed * 2;
+            char *grown = realloc(buffer->data, capacity);
+            if (!grown) return ESP_ERR_NO_MEM;
+            buffer->data = grown;
+            buffer->capacity = capacity;
+        }
+        memcpy(buffer->data + buffer->length, event->data, event->data_len);
+        buffer->length += event->data_len;
+        buffer->data[buffer->length] = 0;
     }
-    memcpy(buffer->data + buffer->length, event->data, event->data_len);
-    buffer->length += event->data_len;
-    buffer->data[buffer->length] = 0;
     return ESP_OK;
 }
 
@@ -274,17 +294,30 @@ static bool fetch_manifest(void)
     s_state = OTA_CHECKING;
     clear_error();
     response_buffer_t body = {0};
+    ota_http_ctx_t ctx = {.body = &body};
     esp_http_client_config_t config = {
         .url = s_channel == 1 ? OTA_MANIFEST_EDGE : OTA_MANIFEST_STABLE,
-        .event_handler = collect_http_data,
-        .user_data = &body,
+        .event_handler = ota_http_event_handler,
+        .user_data = &ctx,
         .timeout_ms = OTA_HTTP_TIMEOUT_MS,
+        .buffer_size = 16384,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = "Rotator/" ROTATOR_VERSION,
+        .disable_auto_redirect = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_err_t error = client ? esp_http_client_perform(client) : ESP_ERR_NO_MEM;
-    int status = client ? esp_http_client_get_status_code(client) : 0;
+    esp_err_t error = client ? ESP_OK : ESP_ERR_NO_MEM;
+    int status = 0;
+    for (int redirects = 0; client && error == ESP_OK; ++redirects) {
+        ctx.location[0] = 0;
+        body.length = 0;
+        if (body.data) body.data[0] = 0;
+        error = esp_http_client_perform(client);
+        status = esp_http_client_get_status_code(client);
+        if (error != ESP_OK || status < 300 || status >= 400 || !ctx.location[0]) break;
+        if (redirects >= OTA_MAX_REDIRECTS) { error = ESP_FAIL; break; }
+        esp_http_client_set_url(client, ctx.location);
+    }
     if (client) esp_http_client_cleanup(client);
     if (error != ESP_OK || status != 200) {
         char detail[64];
@@ -386,7 +419,10 @@ static esp_err_t config_handler(httpd_req_t *req)
         s_check_interval = hours >= 0 && hours <= 168 ? hours : 24;
     }
     cJSON_Delete(root);
-    save_config();
+    if (!save_config()) {
+        set_error("otaConfigSave", "Could not persist update settings");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+    }
     return send_status(req);
 }
 
@@ -404,11 +440,16 @@ static esp_err_t stream_to_partition(const char *url, const char *expected_sha, 
                                      const esp_partition_t *partition, bool firmware)
 {
     if (!partition || expected_size == 0 || expected_size > partition->size) return ESP_ERR_INVALID_SIZE;
+    ota_http_ctx_t ctx = {0};
     esp_http_client_config_t config = {
         .url = url,
+        .event_handler = ota_http_event_handler,
+        .user_data = &ctx,
         .timeout_ms = OTA_HTTP_TIMEOUT_MS,
+        .buffer_size = 16384,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = "Rotator/" ROTATOR_VERSION,
+        .disable_auto_redirect = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client || esp_http_client_open(client, 0) != ESP_OK) {
@@ -416,10 +457,13 @@ static esp_err_t stream_to_partition(const char *url, const char *expected_sha, 
         return ESP_FAIL;
     }
     esp_http_client_fetch_headers(client);
-    int redirects = 0;
-    while (esp_http_client_get_status_code(client) >= 300 &&
-           esp_http_client_get_status_code(client) < 400 && redirects++ < 5) {
-        if (esp_http_client_set_redirection(client) != ESP_OK) break;
+    for (int redirects = 0; redirects < OTA_MAX_REDIRECTS; ++redirects) {
+        int status = esp_http_client_get_status_code(client);
+        if (status < 300 || status >= 400 || !ctx.location[0]) break;
+        char location[OTA_LOCATION_BUF];
+        snprintf(location, sizeof(location), "%s", ctx.location);
+        ctx.location[0] = 0;
+        esp_http_client_set_url(client, location);
         esp_http_client_close(client);
         if (esp_http_client_open(client, 0) != ESP_OK) break;
         esp_http_client_fetch_headers(client);

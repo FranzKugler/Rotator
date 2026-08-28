@@ -1,0 +1,829 @@
+/**
+ * app
+ * Styling of the configuration SPA. Self-contained, so the page also works
+ * on a network without internet access, and follows the system's
+ * light/dark preference.
+ *
+ * @author   Franz Kugler / franz _AT_ franz _MINUS_ kugler _DOT_ de
+ * @version  2.0
+ * @created  15.8.2026
+ * @updated  15.8.2026
+ */
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --text: #1c1f23;
+  --muted: #6b7280;
+  --border: #d9dce1;
+  --accent: #3b6ea5;
+  --accent-text: #ffffff;
+  --danger: #b3261e;
+  --danger-bg: #fdecea;
+  --radius: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c;
+    --surface: #1f2228;
+    --text: #e6e8eb;
+    --muted: #9aa1ab;
+    --border: #343941;
+    --accent: #6ea8dc;
+    --accent-text: #10131a;
+    --danger: #f2b8b5;
+    --danger-bg: #3b1f1d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.app {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+/*
+ * Stays put while the rest scrolls. The negative top margin cancels the
+ * padding of .app so the initial layout is unchanged, while the padding makes
+ * that space part of the sticky box - and the space below the separator is
+ * padding rather than margin for the same reason: anything left as margin is
+ * unpainted, and scrolling content would show through the gap.
+ */
+header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg);
+  margin-top: -1rem;
+  padding-top: 1rem;
+  padding-bottom: 1.25rem;
+}
+
+header h1 {
+  margin: 0.25rem 0 1rem;
+  font-size: 1.35rem;
+  letter-spacing: 0.02em;
+}
+
+/* ---------- tabs ---------- */
+
+nav {
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.tabs button {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  padding: 0.6rem 0.9rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.tabs button:hover {
+  color: var(--text);
+}
+
+.tabs button[aria-current="page"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+/* The menu button only exists on narrow screens; see the media query below. */
+.menu-toggle {
+  display: none;
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.7rem 0.2rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+/* Three bars, drawn rather than loaded - nothing here may need the network. */
+.burger {
+  position: relative;
+  display: block;
+  width: 1.15rem;
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  transition: background-color 0.15s;
+}
+
+.burger::before,
+.burger::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: currentColor;
+  border-radius: inherit;
+  transition: transform 0.15s;
+}
+
+.burger::before {
+  transform: translateY(-6px);
+}
+
+.burger::after {
+  transform: translateY(6px);
+}
+
+/* Open: the bars fold into a cross. */
+nav.open .burger {
+  background-color: transparent;
+}
+
+nav.open .burger::before {
+  transform: rotate(45deg);
+}
+
+nav.open .burger::after {
+  transform: rotate(-45deg);
+}
+
+/*
+ * Below this the five tabs no longer fit on one line. The threshold is set for
+ * the longest translation (Italian, "Visualizzazione … Aggiornamento"), so the
+ * row never wraps in any language.
+ *
+ * Vertical space is the scarce resource on a phone, so the title and the menu
+ * button share one bar, and the menu opens as a floating panel rather than
+ * pushing the content down.
+ */
+@media (max-width: 40rem) {
+  .app {
+    padding: 0.75rem;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-top: -0.75rem;
+    padding-top: 0.75rem;
+    /* 0.4rem down to the separator, 0.9rem below it - both painted. */
+    padding-bottom: 1.3rem;
+  }
+
+  /*
+   * The separator, drawn inside the padding instead of as a border, so the gap
+   * beneath it still belongs to the sticky box. Absolutely positioned, so it is
+   * not a flex item of the bar.
+   */
+  header::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0.9rem;
+    height: 1px;
+    background: var(--border);
+  }
+
+  header h1 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+
+  nav {
+    position: relative;
+    border-bottom: none;
+  }
+
+  .menu-toggle {
+    display: flex;
+    width: auto;
+    padding: 0.3rem 0.1rem;
+    color: var(--muted);
+  }
+
+  .tabs {
+    display: none;
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.55rem);
+    z-index: 10;
+    flex-direction: column;
+    gap: 0;
+    min-width: 11rem;
+    padding: 0.3rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.22);
+  }
+
+  nav.open .tabs {
+    display: flex;
+  }
+
+  .tabs button {
+    padding: 0.55rem 0.7rem;
+    text-align: left;
+    border-bottom: none;
+    border-left: 2px solid transparent;
+    border-radius: 6px;
+    margin-bottom: 0;
+  }
+
+  .tabs button[aria-current="page"] {
+    border-bottom-color: transparent;
+    border-left-color: var(--accent);
+  }
+
+  .card {
+    padding: 0.85rem 0.9rem;
+    margin-bottom: 0.75rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .burger,
+  .burger::before,
+  .burger::after {
+    transition: none;
+  }
+}
+
+/* ---------- cards & fields ---------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  margin-bottom: 1rem;
+}
+
+.card > h2 {
+  margin: 0 0 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.4rem 0;
+}
+
+.field > label,
+.field > .key {
+  flex: 0 0 auto;
+}
+
+.hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"],
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.4rem 0.55rem;
+  min-width: 0;
+}
+
+/* Controls in a field row share one width, so a card reads as an aligned
+   column instead of each control sizing itself to its longest option.
+   Shrinkable, so they still fit on narrow screens. */
+.field > select,
+.field > input[type="text"],
+.field > input[type="number"],
+.field > input[type="password"] {
+  flex: 0 1 15rem;
+}
+
+input[type="text"]:focus-visible,
+input[type="number"]:focus-visible,
+select:focus-visible,
+nav button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input:disabled,
+select:disabled {
+  opacity: 0.45;
+}
+
+/* radio list */
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.3rem 0;
+  cursor: pointer;
+}
+
+.choice input {
+  accent-color: var(--accent);
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+}
+
+/* switch */
+
+.switch {
+  position: relative;
+  width: 2.6rem;
+  height: 1.5rem;
+  flex: 0 0 auto;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  cursor: pointer;
+}
+
+.switch span {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 999px;
+  transition: background 0.15s;
+  pointer-events: none;
+}
+
+.switch span::after {
+  content: "";
+  position: absolute;
+  top: 0.17rem;
+  left: 0.17rem;
+  width: 1.16rem;
+  height: 1.16rem;
+  background: var(--surface);
+  border-radius: 50%;
+  transition: transform 0.15s;
+}
+
+.switch input:checked + span {
+  background: var(--accent);
+}
+
+.switch input:checked + span::after {
+  transform: translateX(1.1rem);
+}
+
+.switch input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- colour section ---------- */
+
+.picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 0.5rem 0 1rem;
+}
+
+.wheel {
+  flex: 0 0 auto;
+}
+
+/* The clock's face, eleven letters by ten rows plus the four corner LEDs.
+   Square and the same size as the wheel (both from WHEEL_SIZE in
+   Color.svelte). The ground is a light grey standing in for the clock's face
+   rather than black, so letters set to white stay visible. It is the light
+   theme's --bg written out rather than the variable itself: the panel
+   represents a physical, pale clock face, and following --bg into dark mode
+   would turn it near black and defeat the point. Keep it in step with FACE in
+   Color.svelte, which blends the letters into it.
+   Border and radius match the dropdowns. */
+.preview {
+  position: relative;
+  flex: 0 0 auto;
+  width: var(--size);
+  height: var(--size);
+  display: grid;
+  place-items: center;
+  padding: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgb(244 245 247);
+}
+
+/* Not called .grid: that name already belongs to the timezone tab's rule
+   editor, which brings a gap of 0.6rem with it. `.preview .grid` overrode the
+   columns but not the gap, and ten column gaps plus nine row gaps came to more
+   than half the width of the face - so the letters were pushed outside their
+   own frame, with the corner LEDs then sitting among them. */
+.preview .letters {
+  display: grid;
+  /* minmax(0, 1fr) rather than 1fr: a plain fr has the content as its minimum,
+     so one wide letter in one cell can push the whole grid past its box. The
+     face has a fixed size and the letters have to fit inside it, not the other
+     way round. */
+  grid-template-columns: repeat(11, minmax(0, 1fr));
+  grid-template-rows: repeat(10, minmax(0, 1fr));
+  gap: 0;
+  width: 100%;
+  height: 100%;
+  /* A cell is wider than it is tall by 10:11, which is exactly the ratio the
+     real panel has: body.scad stretches the row pitch by 11/10 so that eleven
+     columns and ten rows come out square. */
+  place-items: center;
+}
+
+.preview .letters span {
+  /* Unlit letters are still there on a real panel - milled or printed - so
+     they are drawn faintly rather than hidden. A blank grid then means "no
+     panel data", which is a different thing from a clock that is switched
+     off, and the two must not look alike. */
+  color: rgb(0 0 0 / 0.13);
+  font-weight: 600;
+  /* A cell is --size/11 wide by --size/10 tall - about 16 by 17 px at the
+     current 200 px face - so the letter wants to be around 12 px to read as a
+     grid rather than as scattered dots. Divided out of --size rather than
+     fixed, so the face can be resized in one place; the clamp is a guard, not
+     the value, and /26 used to put it below its own floor. */
+  font-size: clamp(0.55rem, calc(var(--size) / 17), 1rem);
+  line-height: 1;
+  transition: color 0.08s linear, text-shadow 0.08s linear;
+}
+
+.preview .letters span.on {
+  color: var(--led);
+  text-shadow: 0 0 8px var(--led);
+}
+
+/* The four corner LEDs, in the corners of the face itself rather than in the
+   grid: they sit outside the eleven columns on the real clock too. */
+.preview .corner {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 0.13);
+  transition: background 0.08s linear, box-shadow 0.08s linear;
+}
+
+.preview .corner.on {
+  background: var(--led);
+  box-shadow: 0 0 8px var(--led);
+}
+
+.preview .corner.tl { top: 0.4rem; left: 0.4rem; }
+.preview .corner.tr { top: 0.4rem; right: 0.4rem; }
+.preview .corner.br { bottom: 0.4rem; right: 0.4rem; }
+.preview .corner.bl { bottom: 0.4rem; left: 0.4rem; }
+
+/* slider rows (hue, brightness) */
+
+.ctl {
+  padding: 0.45rem 0;
+}
+
+.ctl-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.3rem;
+}
+
+.ctl-head output {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.ctl-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ctl-row input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+button.step {
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  font: inherit;
+  line-height: 1;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button.step:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button.step:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* range inputs need their track and thumb styled per engine */
+
+input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  /* same height as button.step, so a slider row lines up */
+  height: 2rem;
+  margin: 0;
+  /* every slider sets its own track inline (SliderRow's `track` prop) */
+  --track: var(--border);
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  box-sizing: border-box;
+  height: 2rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--track);
+}
+
+input[type="range"]::-moz-range-track {
+  box-sizing: border-box;
+  height: 2rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--track);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 1.4rem;
+  height: 1.4rem;
+  margin-top: 0.29rem;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+  cursor: pointer;
+}
+
+input[type="range"]::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+  cursor: pointer;
+}
+
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 999px;
+}
+
+/* ---------- timezone rules ---------- */
+
+.rule {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 0.9rem;
+  margin-bottom: 0.75rem;
+}
+
+.rule > h3 {
+  margin: 0 0 0.6rem;
+  font-size: 0.9rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(5.5rem, 1fr));
+  gap: 0.6rem;
+}
+
+.grid label {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+}
+
+.grid input,
+.grid select {
+  width: 100%;
+}
+
+/* ---------- wifi ---------- */
+
+.netlist {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+}
+
+.netname {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 0.9rem;
+}
+
+.bars i {
+  width: 3px;
+  background: var(--border);
+  border-radius: 1px;
+}
+
+.bars i:nth-child(1) { height: 25%; }
+.bars i:nth-child(2) { height: 50%; }
+.bars i:nth-child(3) { height: 75%; }
+.bars i:nth-child(4) { height: 100%; }
+
+.bars i.on {
+  background: var(--accent);
+}
+
+.lock {
+  font-size: 0.8rem;
+  opacity: 0.65;
+}
+
+button[type="submit"],
+button.primary,
+button.secondary {
+  font: inherit;
+  line-height: 1.5;
+  padding: 0.5rem 1.1rem;
+  border-radius: 7px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+button.secondary {
+  background: var(--surface);
+  color: var(--text);
+}
+
+button[type="submit"]:disabled,
+button.primary:disabled,
+button.secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- file picker ---------- */
+
+/* The native file input is replaced by a square icon button, so it matches the
+   other controls instead of rendering as whatever the browser fancies. The
+   input stays in the page - hidden but focusable - so it is still reachable
+   with the keyboard. */
+.filepick {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.filename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filename.empty {
+  color: var(--muted);
+}
+
+.filepick input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  border: 0;
+}
+
+/* Same padding and line height as the buttons above, so both come out the same
+   height; aspect-ratio then squares it off at whatever that height becomes. */
+.iconbutton {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  line-height: 1.5;
+  aspect-ratio: 1;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.iconbutton svg {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.iconbutton:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.filepick input[type="file"]:focus-visible + .iconbutton {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.filepick input[type="file"]:disabled + .iconbutton {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ---------- messages ---------- */
+
+.banner {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+
+.centered {
+  text-align: center;
+  color: var(--muted);
+  padding: 3rem 1rem;
+}
+
+.centered button {
+  font: inherit;
+  margin-top: 0.75rem;
+  padding: 0.45rem 1.1rem;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--accent);
+  color: var(--accent-text);
+  cursor: pointer;
+}

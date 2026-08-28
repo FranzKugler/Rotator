@@ -4,6 +4,7 @@
 #include "nvs.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include "esp_system.h"
 
 #include <string>
 #include "Configuration.hpp"
@@ -348,6 +349,60 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
 }
 
 // WiFi Server
+static esp_err_t wifi_status_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    uint8_t mac[6] = {};
+    char macbuf[18] = "—";
+    if (wifi_manager_get_mac(mac) == ESP_OK) {
+        snprintf(macbuf, sizeof(macbuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    cJSON_AddBoolToObject(root, "connected", wifi_manager_is_connected());
+    cJSON_AddStringToObject(root, "ssid", wifi_manager_get_ssid());
+    cJSON_AddStringToObject(root, "ip", wifi_manager_get_ip());
+    cJSON_AddNumberToObject(root, "rssi", wifi_manager_get_rssi());
+    cJSON_AddStringToObject(root, "hostname", wifi_manager_get_hostname());
+    cJSON_AddStringToObject(root, "mac", macbuf);
+    const char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t result = httpd_resp_sendstr(req, out);
+    cJSON_free((void *)out);
+    cJSON_Delete(root);
+    return result;
+}
+
+static void restart_after_hostname(void *)
+{
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
+static esp_err_t wifi_hostname_handler(httpd_req_t *req)
+{
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *item = cJSON_GetObjectItem(root, "hostname");
+    char stored[33] = {};
+    esp_err_t error = cJSON_IsString(item)
+        ? wifi_manager_set_hostname(item->valuestring, stored, sizeof(stored))
+        : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(root);
+    if (error != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(error));
+        return error;
+    }
+    char response[96];
+    snprintf(response, sizeof(response), "{\"hostname\":\"%s\",\"restarting\":true}", stored);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, response);
+    xTaskCreate(restart_after_hostname, "hostnameRestart", 2048, nullptr, 1, nullptr);
+    return ESP_OK;
+}
+
 static esp_err_t wifi_scan_handler(httpd_req_t *req)
 {
     // blockierend scannen
@@ -475,6 +530,18 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = wifi_connect_handler};
     httpd_register_uri_handler(server, &s2);
+
+    httpd_uri_t wifi_status = {
+        .uri = "/api/wifi/status",
+        .method = HTTP_GET,
+        .handler = wifi_status_handler};
+    httpd_register_uri_handler(server, &wifi_status);
+
+    httpd_uri_t wifi_hostname = {
+        .uri = "/api/wifi/hostname",
+        .method = HTTP_POST,
+        .handler = wifi_hostname_handler};
+    httpd_register_uri_handler(server, &wifi_hostname);
 
     // SSE endpoints
     httpd_uri_t zero_sse = {

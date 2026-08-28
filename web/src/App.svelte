@@ -5,9 +5,11 @@
   import { calibrationStream, connectAngles, postJson, requestJson } from './lib/api.js';
 
   const VERSION = __ROTATOR_VERSION__;
+  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Update'];
 
-  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Firmware'];
   let active = $state('Position');
+  let menuOpen = $state(false);
+  let navEl = $state(null);
   let notice = $state('');
   let error = $state(false);
   let angle = $state(0);
@@ -18,6 +20,10 @@
   let ssid = $state('');
   let password = $state('');
   let wifiStatus = $state('');
+  let currentWifi = $state(null);
+  let wifiStatusError = $state('');
+  let hostname = $state('');
+  let hostnameBusy = $state(false);
   let scanBusy = $state(false);
   let zeroProgress = $state(null);
   let angleProgress = $state(null);
@@ -27,6 +33,20 @@
     error = failed;
     window.clearTimeout(announce.timer);
     announce.timer = window.setTimeout(() => notice = '', 5000);
+  }
+
+  function select(tab) {
+    active = tab;
+    menuOpen = false;
+    if (tab === 'WLAN' && !aps.length) scan();
+  }
+
+  function onWindowKeydown(event) {
+    if (event.key === 'Escape') menuOpen = false;
+  }
+
+  function onWindowPointerdown(event) {
+    if (menuOpen && navEl && !navEl.contains(event.target)) menuOpen = false;
   }
 
   async function loadNetwork() {
@@ -39,22 +59,65 @@
     catch (reason) { announce(`${label} failed: ${reason.message}`, true); }
   }
 
+  function strongestPerName(found) {
+    const best = new Map();
+    for (const ap of found) {
+      if (!ap.ssid) continue;
+      const seen = best.get(ap.ssid);
+      if (!seen || ap.rssi > seen.rssi) best.set(ap.ssid, ap);
+    }
+    return [...best.values()].sort((a, b) => b.rssi - a.rssi);
+  }
+
   async function scan() {
     scanBusy = true;
     try {
       const result = await requestJson('/api/wifi/scan');
-      aps = [...(result.aps || [])].sort((a, b) => b.rssi - a.rssi);
+      aps = strongestPerName(result.aps || []);
     } catch (reason) { announce(`WLAN scan failed: ${reason.message}`, true); }
     finally { scanBusy = false; }
   }
 
-  async function connectWifi() {
+  async function loadWifiStatus() {
+    try {
+      currentWifi = await requestJson('/api/wifi/status');
+      hostname = currentWifi.hostname || '';
+      wifiStatusError = '';
+    } catch (reason) { wifiStatusError = reason.message; }
+  }
+
+  async function saveHostname(event) {
+    event.preventDefault();
+    if (!hostname.trim() || hostnameBusy) return;
+    hostnameBusy = true;
+    try {
+      const result = await postJson('/api/wifi/hostname', { hostname });
+      hostname = result.hostname;
+      announce(`Device name saved as ${hostname}.local · restarting`);
+    } catch (reason) { announce(`Device name failed: ${reason.message}`, true); }
+    finally { hostnameBusy = false; }
+  }
+
+  function quality(rssi) {
+    return rssi >= -55 ? 'Excellent' : rssi >= -67 ? 'Good' : rssi >= -75 ? 'Fair' : 'Weak';
+  }
+
+  async function connectWifi(event) {
+    event.preventDefault();
     if (!ssid.trim()) return announce('Enter or select an SSID', true);
     try {
       const result = await postJson('/api/wifi/connect', { ssid, password });
+      password = '';
       wifiStatus = result.connected ? `Connected · ${result.ip}` : 'Connection requested';
       announce(wifiStatus);
     } catch (reason) { announce(`Connection failed: ${reason.message}`, true); }
+  }
+
+  function bars(rssi) {
+    if (rssi >= -55) return 4;
+    if (rssi >= -67) return 3;
+    if (rssi >= -75) return 2;
+    return 1;
   }
 
   function calibrate(path, completeEvent, kind) {
@@ -74,6 +137,7 @@
 
   onMount(() => {
     loadNetwork();
+    loadWifiStatus();
     const socket = connectAngles((data) => {
       angle = Number(data.angle) || 0;
       mechAngle = Number(data.mechAngle) || 0;
@@ -84,130 +148,148 @@
   });
 </script>
 
-<svelte:head><title>AG2998 Rotator</title><meta name="theme-color" content="#0b1118" /></svelte:head>
+<svelte:window onkeydown={onWindowKeydown} onpointerdown={onWindowPointerdown} />
+<svelte:head><title>AG2998 Camera Rotator</title><meta name="theme-color" content="#f4f5f7" /></svelte:head>
 
-<header>
-  <div class="brand"><span class="mark">AG</span><div><strong>AG2998 Rotator</strong><small>ASCOM Alpaca · ESP32-S3</small></div></div>
-  <div class="live"><span></span> live telemetry</div>
-</header>
+<div class="app">
+  <header>
+    <h1>AG2998 Camera Rotator</h1>
+    <nav bind:this={navEl} class:open={menuOpen} aria-label="Configuration sections">
+      <button type="button" class="menu-toggle" aria-expanded={menuOpen} aria-controls="tabs" onclick={() => menuOpen = !menuOpen}>
+        <span class="burger" aria-hidden="true"></span><span>{active}</span>
+      </button>
+      <div class="tabs" id="tabs">
+        {#each tabs as tab}
+          <button type="button" aria-current={active === tab ? 'page' : undefined} onclick={() => select(tab)}>{tab}</button>
+        {/each}
+      </div>
+    </nav>
+  </header>
 
-<nav aria-label="Configuration sections">
-  {#each tabs as tab}
-    <button class:active={active === tab} onclick={() => { active = tab; if (tab === 'WLAN' && !aps.length) scan(); }}>{tab}</button>
-  {/each}
-</nav>
-
-<main>
   {#if active === 'Position'}
-    <section class="position">
-      <div class="gauge"><AngleGauge {angle} {direction} /></div>
-      <div class="telemetry">
-        <p class="eyebrow">Live position</p>
-        <div class="primary"><strong>{angle.toFixed(2)}</strong><span>°</span></div>
-        <div class="direction"><span class:ccw={direction === 'ccw'}>↻</span>{direction === 'cw' ? 'clockwise' : 'counter-clockwise'}</div>
-        <div class="metric"><span>Mechanical angle</span><strong>{mechAngle.toFixed(2)}°</strong></div>
-        <div class="metric"><span>Interface</span><strong>Alpaca Rotator</strong></div>
+    <section class="card position-card">
+      <h2>Live position</h2>
+      <div class="position">
+        <div class="gauge"><AngleGauge {angle} {direction} /></div>
+        <div class="telemetry">
+          <div class="primary-angle"><strong>{angle.toFixed(2)}</strong><span>°</span></div>
+          <div class="direction"><span class:ccw={direction === 'ccw'}>↻</span>{direction === 'cw' ? 'clockwise' : 'counter-clockwise'}</div>
+          <div class="field"><span class="key">Mechanical angle</span><span>{mechAngle.toFixed(2)}°</span></div>
+          <div class="field"><span class="key">Interface</span><span>Alpaca Rotator</span></div>
+        </div>
       </div>
     </section>
   {:else if active === 'Network'}
-    <section><p class="eyebrow">USB RNDIS</p><h1>Network identity</h1><p class="intro">Settings for the rotator's direct USB network interface.</p>
-      <div class="form-grid">
-        <label>IP address<input bind:value={network.ip} inputmode="decimal" /><button onclick={() => saveNetwork('/api/network/set/ip', { ip: network.ip }, 'IP address')}>Save</button></label>
-        <label>Netmask<input bind:value={network.netmask} inputmode="decimal" /><button onclick={() => saveNetwork('/api/network/set/netmask', { netmask: network.netmask }, 'Netmask')}>Save</button></label>
-        <label>MAC address<input bind:value={network.mac} /><button onclick={() => saveNetwork('/api/network/set/mac', { mac: network.mac }, 'MAC address')}>Save</button></label>
+    <section class="card">
+      <h2>USB RNDIS network</h2>
+      <p class="hint">Settings for the rotator's direct USB network interface.</p>
+      <div class="network-fields">
+        <div><label for="ip">IP address</label><input id="ip" type="text" bind:value={network.ip} inputmode="decimal" /><button class="primary" onclick={() => saveNetwork('/api/network/set/ip', { ip: network.ip }, 'IP address')}>Save</button></div>
+        <div><label for="netmask">Netmask</label><input id="netmask" type="text" bind:value={network.netmask} inputmode="decimal" /><button class="primary" onclick={() => saveNetwork('/api/network/set/netmask', { netmask: network.netmask }, 'Netmask')}>Save</button></div>
+        <div><label for="mac">MAC address</label><input id="mac" type="text" bind:value={network.mac} /><button class="primary" onclick={() => saveNetwork('/api/network/set/mac', { mac: network.mac }, 'MAC address')}>Save</button></div>
       </div>
     </section>
   {:else if active === 'WLAN'}
-    <section><div class="section-head"><div><p class="eyebrow">Wireless</p><h1>Join a network</h1></div><button class="secondary" disabled={scanBusy} onclick={scan}>{scanBusy ? 'Scanning…' : 'Scan again'}</button></div>
-      <div class="wifi-grid">
-        <div class="ap-list">
-          {#if !aps.length}<p class="empty">No access points loaded.</p>{/if}
-          {#each aps as ap}
-            <button onclick={() => ssid = ap.ssid}><span class="signal">{ap.rssi > -60 ? '●●●' : ap.rssi > -75 ? '●●○' : '●○○'}</span><span>{ap.ssid || '(hidden network)'}</span><small>{ap.authmode ? 'locked' : 'open'} · {ap.rssi} dBm</small></button>
+    <section class="card">
+      <h2>Connection</h2>
+      {#if wifiStatusError}<p class="banner">Status unavailable · {wifiStatusError}</p>
+      {:else if currentWifi}
+        <div class="field"><span class="key">Network</span><span>{currentWifi.ssid || '—'}</span></div>
+        <div class="field"><span class="key">Address</span><span>{currentWifi.ip || '—'}</span></div>
+        <div class="field"><span class="key">Signal</span><span>{quality(currentWifi.rssi)} ({currentWifi.rssi} dBm)</span></div>
+        <div class="field"><span class="key">Hostname</span><span>{currentWifi.hostname}.local</span></div>
+        <div class="field"><span class="key">MAC</span><span>{currentWifi.mac}</span></div>
+      {:else}<p class="hint">Loading…</p>{/if}
+    </section>
+
+    <section class="card">
+      <h2>Device name</h2>
+      <form onsubmit={saveHostname}>
+        <div class="field"><label for="hostname">Name</label><input id="hostname" type="text" maxlength="32" bind:value={hostname} autocomplete="off" spellcheck="false" /></div>
+        <button type="submit" disabled={!hostname.trim() || hostnameBusy}>{hostnameBusy ? 'Restarting…' : 'Save and restart'}</button>
+      </form>
+      <p class="hint">Enter the name without <code>.local</code>. The rotator will be reachable as <code>{hostname || 'AG2998-Rotator'}.local</code>.</p>
+    </section>
+
+    <section class="card">
+      <h2>Available networks</h2>
+      {#if scanBusy}
+        <p class="hint">Scanning…</p>
+      {:else if !aps.length}
+        <p class="hint">No networks found.</p>
+      {:else}
+        <ul class="netlist">
+          {#each aps as ap (ap.ssid)}
+            <li>
+              <label class="choice">
+                <input type="radio" name="ssid" value={ap.ssid} bind:group={ssid} />
+                <span class="netname">{ap.ssid}</span>
+                <span class="bars" title="{ap.rssi} dBm" aria-label="Signal strength">
+                  {#each [1, 2, 3, 4] as bar}<i class:on={bar <= bars(ap.rssi)}></i>{/each}
+                </span>
+                {#if ap.authmode}<span class="lock" title="Encrypted">🔒</span>{/if}
+              </label>
+            </li>
           {/each}
-        </div>
-        <div class="connect-card"><label>SSID<input bind:value={ssid} autocomplete="off" /></label><label>Password<input type="password" bind:value={password} autocomplete="new-password" /></label><button onclick={connectWifi}>Connect</button>{#if wifiStatus}<p class="status">{wifiStatus}</p>{/if}</div>
-      </div>
+        </ul>
+      {/if}
+      <button type="button" class="secondary" onclick={scan} disabled={scanBusy}>{scanBusy ? 'Scanning…' : 'Scan again'}</button>
+    </section>
+
+    <section class="card">
+      <h2>Switch network</h2>
+      <form onsubmit={connectWifi}>
+        <div class="field"><label for="ssid">Network</label><input id="ssid" type="text" bind:value={ssid} placeholder="SSID" /></div>
+        <div class="field"><label for="pass">Password</label><input id="pass" type="password" bind:value={password} autocomplete="off" placeholder="Network password" /></div>
+        <button type="submit" disabled={!ssid.trim()}>Connect</button>
+      </form>
+      {#if wifiStatus}<p class="hint success">{wifiStatus}</p>{/if}
     </section>
   {:else if active === 'Calibration'}
-    <section><p class="eyebrow">Mechanical reference</p><h1>Calibration</h1><p class="intro warning">These operations move the rotator. Make sure the mechanism can travel safely before starting.</p>
-      <div class="cards">
-        <article><span class="number">01</span><h2>Find mechanical zero</h2><p>Searches the Hall-sensor index and measures its centre.</p><button disabled={zeroProgress !== null} onclick={() => calibrate('/api/calibration/zero/stream', 'complete_zero', 'zero')}>Find zero</button>{#if zeroProgress !== null}<progress max="100" value={zeroProgress}></progress><small>{zeroProgress}%</small>{/if}</article>
-        <article><span class="number">02</span><h2>Calibrate angle sensor</h2><p>Measures the AS5600 error over a full calibration sequence.</p><button disabled={angleProgress !== null} onclick={() => calibrate('/api/calibration/angle/stream', 'complete_angle', 'angle')}>Calibrate sensor</button>{#if angleProgress !== null}<progress max="100" value={angleProgress}></progress><small>{angleProgress}%</small>{/if}</article>
+    <section class="card">
+      <h2>Mechanical reference</h2>
+      <p class="banner warning">These operations move the rotator. Make sure the mechanism can travel safely before starting.</p>
+      <div class="calibration-actions">
+        <div><h3>Find mechanical zero</h3><p class="hint">Searches the Hall-sensor index and measures its centre.</p><button class="primary" disabled={zeroProgress !== null} onclick={() => calibrate('/api/calibration/zero/stream', 'complete_zero', 'zero')}>Find zero</button>{#if zeroProgress !== null}<div class="progress"><div class="bar" style="width: {zeroProgress}%"></div></div><p class="hint">{zeroProgress}%</p>{/if}</div>
+        <div><h3>Calibrate angle sensor</h3><p class="hint">Measures the AS5600 error over a full calibration sequence.</p><button class="primary" disabled={angleProgress !== null} onclick={() => calibrate('/api/calibration/angle/stream', 'complete_angle', 'angle')}>Calibrate sensor</button>{#if angleProgress !== null}<div class="progress"><div class="bar" style="width: {angleProgress}%"></div></div><p class="hint">{angleProgress}%</p>{/if}</div>
       </div>
     </section>
   {:else}
     <Firmware />
   {/if}
-</main>
 
-{#if notice}<div class:error class="notice" role="status">{notice}</div>{/if}
-<footer>Rotator {VERSION} <span>·</span> Astro Geeks Munich</footer>
+  {#if notice}<p class:error class="banner notice" role="status">{notice}</p>{/if}
+  <footer>Firmware {VERSION} · Astro Geeks Munich</footer>
+</div>
 
 <style>
-  :global(*) { box-sizing: border-box; }
-  :global(html) { color-scheme: dark; background: #0b1118; }
-  :global(body) { margin: 0; min-width: 320px; min-height: 100vh; color: #dce8f2; background: radial-gradient(circle at 82% 5%, #173344 0, transparent 30rem), #0b1118; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
-  button, input { font: inherit; }
-  header { height: 5.2rem; padding: 0 6vw; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #243340; }
-  .brand { display: flex; align-items: center; gap: .8rem; }
-  .brand strong { display: block; letter-spacing: .02em; }
-  .brand small { color: #7890a3; font-size: .72rem; text-transform: uppercase; letter-spacing: .13em; }
-  .mark { display: grid; place-items: center; width: 2.5rem; height: 2.5rem; border: 1px solid #21d4b4; color: #21d4b4; font-weight: 800; }
-  .live { color: #8aa0b2; font-size: .8rem; text-transform: uppercase; letter-spacing: .12em; }
-  .live span { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; background: #21d4b4; margin-right: .5rem; box-shadow: 0 0 10px #21d4b4; }
-  nav { padding: 0 6vw; display: flex; gap: 2rem; border-bottom: 1px solid #243340; overflow-x: auto; }
-  nav button { padding: 1rem 0 .85rem; border: 0; border-bottom: 2px solid transparent; background: none; color: #71899c; cursor: pointer; white-space: nowrap; }
-  nav button.active { color: #fff; border-color: #ff7a4d; }
-  main { max-width: 1100px; margin: 0 auto; padding: clamp(2rem, 6vw, 5rem) 1.5rem; min-height: calc(100vh - 12.5rem); }
-  section { animation: enter .28s ease both; }
-  @keyframes enter { from { opacity: 0; transform: translateY(8px); } }
-  h1 { margin: .2rem 0 .5rem; font-size: clamp(2rem, 5vw, 3.4rem); letter-spacing: -.04em; }
-  h2 { margin: .5rem 0; }
-  .eyebrow { color: #21d4b4; text-transform: uppercase; letter-spacing: .18em; font-size: .75rem; font-weight: 700; }
-  .intro { color: #8da1b3; max-width: 44rem; margin-bottom: 2rem; }
-  .warning { border-left: 2px solid #ff7a4d; padding-left: 1rem; color: #ddaa98; }
-  .position { display: grid; grid-template-columns: 1.15fr .85fr; align-items: center; gap: 5rem; }
+  .position { display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 2rem; }
   .gauge { display: grid; place-items: center; }
-  .primary { display: flex; align-items: start; gap: .4rem; margin: .5rem 0; }
-  .primary strong { font: 300 clamp(4.6rem, 11vw, 8rem)/.88 ui-monospace, monospace; letter-spacing: -.09em; }
-  .primary span { color: #ff7a4d; font-size: 2rem; }
-  .direction { color: #91a7b8; margin: 1rem 0 2.5rem; text-transform: uppercase; letter-spacing: .12em; font-size: .76rem; }
-  .direction span { color: #21d4b4; display: inline-block; font-size: 1.4rem; margin-right: .5rem; }
+  .primary-angle { display: flex; align-items: flex-start; margin-bottom: .5rem; }
+  .primary-angle strong { font: 300 clamp(3.5rem, 10vw, 6rem)/.9 ui-monospace, monospace; letter-spacing: -.08em; }
+  .primary-angle span { color: var(--accent); font-size: 1.6rem; }
+  .direction { color: var(--muted); margin-bottom: 1rem; text-transform: uppercase; letter-spacing: .08em; font-size: .75rem; }
+  .direction span { color: var(--accent); display: inline-block; font-size: 1.2rem; margin-right: .4rem; }
   .direction span.ccw { transform: scaleX(-1); }
-  .metric { display: flex; justify-content: space-between; border-top: 1px solid #2a3945; padding: 1rem 0; color: #8298aa; }
-  .metric strong { color: #dce8f2; }
-  .section-head { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
-  .form-grid { display: grid; gap: 1rem; max-width: 48rem; }
-  label { color: #8fa4b6; font-size: .82rem; text-transform: uppercase; letter-spacing: .1em; }
-  .form-grid label { display: grid; grid-template-columns: 1fr auto; gap: .7rem; }
-  .form-grid label input { grid-column: 1; }
-  input { width: 100%; margin-top: .45rem; padding: .85rem 1rem; color: #eef6fb; background: #121c25; border: 1px solid #344552; border-radius: 3px; outline: none; }
-  input:focus { border-color: #21d4b4; box-shadow: 0 0 0 3px rgb(33 212 180 / .12); }
-  button { border: 0; border-radius: 3px; padding: .78rem 1.2rem; color: #07110f; background: #21d4b4; font-weight: 750; cursor: pointer; }
-  button:hover { filter: brightness(1.08); }
-  button:disabled { opacity: .55; cursor: wait; }
-  .secondary { color: #dce8f2; background: #22313d; }
-  .wifi-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 1.3rem; }
-  .ap-list, .connect-card, article { border: 1px solid #2c3b47; background: rgb(17 26 35 / .86); }
-  .ap-list { max-height: 25rem; overflow: auto; }
-  .ap-list button { width: 100%; display: grid; grid-template-columns: 3rem 1fr auto; text-align: left; color: #dce8f2; background: transparent; border-bottom: 1px solid #273641; border-radius: 0; }
-  .ap-list small { color: #71889a; }
-  .signal { color: #21d4b4; letter-spacing: -.18em; }
-  .empty { padding: 2rem; color: #72889a; }
-  .connect-card { padding: 1.5rem; display: grid; gap: 1.2rem; align-content: start; }
-  .status { color: #21d4b4; }
-  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.2rem; }
-  article { padding: 1.8rem; position: relative; overflow: hidden; }
-  article p { min-height: 3rem; color: #8298aa; }
-  article button { margin-top: .7rem; }
-  .number { color: #ff7a4d; font: 700 .8rem ui-monospace, monospace; letter-spacing: .12em; }
-  progress { display: block; width: 100%; height: .35rem; margin-top: 1.4rem; accent-color: #21d4b4; }
-  .file { display: block; padding: 1rem; border: 1px dashed #435462; color: #91a7b8; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; }
-  .file input { position: absolute; opacity: 0; pointer-events: none; }
-  code { color: #d7b57e; }
-  .notice { position: fixed; right: 1.5rem; bottom: 1.5rem; max-width: 28rem; padding: 1rem 1.2rem; color: #062019; background: #21d4b4; box-shadow: 0 14px 50px #0009; }
-  .notice.error { color: #fff; background: #b94d38; }
-  footer { height: 3rem; padding: 0 6vw; display: flex; align-items: center; gap: .6rem; color: #587083; border-top: 1px solid #1d2a34; font-size: .75rem; text-transform: uppercase; letter-spacing: .12em; }
-  @media (max-width: 760px) { header { padding: 0 1.2rem; } .live { display: none; } nav { padding: 0 1.2rem; gap: 1.5rem; } .position, .wifi-grid, .cards { grid-template-columns: 1fr; gap: 2rem; } .telemetry { text-align: center; } .metric { text-align: left; } .form-grid label { grid-template-columns: 1fr; } .form-grid label button { grid-column: 1; } .ap-list button { grid-template-columns: 2.5rem 1fr; } .ap-list small { grid-column: 2; } }
+  .field > button { flex: 0 0 auto; }
+  .network-fields { display: grid; grid-template-columns: 1fr; gap: .75rem; }
+  .network-fields > div { display: grid; grid-template-columns: 8rem minmax(0, 1fr) auto; align-items: center; gap: .75rem; }
+  .network-fields input { width: 100%; }
+  code { color: var(--accent); }
+  .calibration-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  .calibration-actions > div + div { border-left: 1px solid var(--border); padding-left: 1.5rem; }
+  .calibration-actions h3 { margin: 0 0 .25rem; font-size: 1rem; }
+  .progress { height: 10px; margin: .75rem 0 .25rem; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .bar { height: 100%; background: var(--accent); }
+  .success { color: var(--accent); }
+  .warning { margin-top: 0; }
+  .notice { position: fixed; right: 1rem; bottom: 1rem; z-index: 30; max-width: 28rem; box-shadow: 0 8px 24px rgb(0 0 0 / .22); }
+  footer { color: var(--muted); padding: .5rem .1rem 1rem; font-size: .75rem; }
+  @media (max-width: 40rem) {
+    .position, .calibration-actions { grid-template-columns: 1fr; }
+    .calibration-actions > div + div { border-left: 0; border-top: 1px solid var(--border); padding: 1rem 0 0; }
+    .field { align-items: stretch; flex-wrap: wrap; }
+    .field > input { flex-basis: 100%; }
+    .network-fields > div { grid-template-columns: 1fr; }
+  }
 </style>
