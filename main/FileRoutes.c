@@ -22,8 +22,10 @@
  */
 #include "FileRoutes.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -39,6 +41,43 @@ static const char *TAG = "fileroutes";
 #define FS_LABEL "littlefs"
 
 // ------ paths ------
+
+/**
+ * Decodes a query-string value in place.
+ *
+ * httpd_query_key_value() hands back the raw bytes between `=` and the next
+ * `&`, untouched - esp_http_server does no percent-decoding of its own. Every
+ * path this project's own browser code sends goes through encodeURIComponent
+ * first, which always escapes a slash as %2F, so a literal path arrives here
+ * still escaped and safe_path() rejects it outright: not a `/`, not absolute,
+ * error. Decoding in place is safe because the result is never longer than
+ * the input. Done before safe_path() runs, not after - so a decoded ".."
+ * still meets the dot-dot check, rather than sailing through as the harmless
+ * looking literal string "%2e%2e".
+ */
+static void url_decode(char *s)
+{
+    char *out = s;
+    while (*s)
+    {
+        if (s[0] == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2]))
+        {
+            char hex[3] = {s[1], s[2], 0};
+            *out++ = (char)strtol(hex, NULL, 16);
+            s += 3;
+        }
+        else if (*s == '+')
+        {
+            *out++ = ' ';
+            s++;
+        }
+        else
+        {
+            *out++ = *s++;
+        }
+    }
+    *out = '\0';
+}
 
 /**
  * Reduces what arrived to a path this rotator will act on, or refuses it.
@@ -120,6 +159,7 @@ static bool arg_path(httpd_req_t *req, char *out, size_t out_size)
     {
         httpd_query_key_value(query, "path", raw, sizeof(raw));
     }
+    url_decode(raw);
     if (safe_path(raw, out, out_size)) return true;
     send_error(req, HTTPD_400_BAD_REQUEST, 400, "fsPath");
     return false;

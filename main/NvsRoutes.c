@@ -38,6 +38,7 @@
  */
 #include "NvsRoutes.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -287,13 +288,45 @@ static esp_err_t send_list(httpd_req_t *req)
     return result;
 }
 
+/**
+ * Decodes a query-string value in place. See FileRoutes.c's url_decode() for
+ * why this is needed at all - esp_http_server never does it on its own, and
+ * a namespace or key containing anything encodeURIComponent() would escape
+ * arrives here still escaped otherwise.
+ */
+static void url_decode(char *s)
+{
+    char *out = s;
+    while (*s)
+    {
+        if (s[0] == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2]))
+        {
+            char hex[3] = {s[1], s[2], 0};
+            *out++ = (char)strtol(hex, NULL, 16);
+            s += 3;
+        }
+        else if (*s == '+')
+        {
+            *out++ = ' ';
+            s++;
+        }
+        else
+        {
+            *out++ = *s++;
+        }
+    }
+    *out = '\0';
+}
+
 static bool query_arg(httpd_req_t *req, const char *name, char *out, size_t out_size)
 {
     char query[128];
     out[0] = '\0';
     if (httpd_req_get_url_query_len(req) == 0 ||
         httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
-    return httpd_query_key_value(query, name, out, out_size) == ESP_OK && out[0] != '\0';
+    if (httpd_query_key_value(query, name, out, out_size) != ESP_OK || out[0] == '\0') return false;
+    url_decode(out);
+    return true;
 }
 
 /**
