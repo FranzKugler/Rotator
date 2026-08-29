@@ -3,10 +3,11 @@
   import AngleGauge from './lib/AngleGauge.svelte';
   import Firmware from './sections/Firmware.svelte';
   import Debug from './sections/Debug.svelte';
+  import Storage from './sections/Storage.svelte';
   import { calibrationStream, connectAngles, postJson, requestJson } from './lib/api.js';
 
   const VERSION = __ROTATOR_VERSION__;
-  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Update', 'Debug'];
+  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Update', 'Debug', 'Storage'];
 
   let active = $state('Position');
   let menuOpen = $state(false);
@@ -257,8 +258,10 @@
     </section>
   {:else if active === 'Update'}
     <Firmware />
-  {:else}
+  {:else if active === 'Debug'}
     <Debug />
+  {:else}
+    <Storage />
   {/if}
 
   {#if notice}<p class:error class="banner notice" role="status">{notice}</p>{/if}

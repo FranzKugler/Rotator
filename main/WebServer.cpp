@@ -8,6 +8,7 @@
 
 #include <string>
 #include "Configuration.hpp"
+#include "ExpertLock.h"
 #include "RotatorHW.h"
 #include "WebServer.h"
 #include "WifiManager.h"
@@ -480,6 +481,23 @@ static esp_err_t wifi_connect_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * Restarts the rotator on request.
+ *
+ * The Storage tab's NVS panel is this route's one caller, and the answer to
+ * its own warning: an edit made straight into NVS only takes effect where
+ * the firmware re-reads that value at boot, so anyone who wants to be sure
+ * asks for a restart here rather than waiting for the next power cycle.
+ */
+static esp_err_t restart_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"restarting\":true}");
+    xTaskCreate(restart_after_hostname, "restart", 2048, NULL, 1, NULL);
+    return ESP_OK;
+}
+
 // registration
 void register_web_handles(httpd_handle_t server)
 {
@@ -542,6 +560,12 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = wifi_hostname_handler};
     httpd_register_uri_handler(server, &wifi_hostname);
+
+    httpd_uri_t restart = {
+        .uri = "/restart",
+        .method = HTTP_POST,
+        .handler = restart_handler};
+    httpd_register_uri_handler(server, &restart);
 
     // SSE endpoints
     httpd_uri_t zero_sse = {

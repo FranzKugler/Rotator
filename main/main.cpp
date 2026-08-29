@@ -24,6 +24,8 @@ extern "C"
 #include "usb_descconfig.h"
 #include "OTAUpdate.h"
 #include "LogBuffer.h"
+#include "FileRoutes.h"
+#include "NvsRoutes.h"
 }
 #include <dirent.h>
 #include <stdio.h>
@@ -145,6 +147,8 @@ extern "C" void app_main(void)
     expert_lock_init();
     expert_lock_register_routes(server);
     log_buffer_register_routes(server);
+    file_routes_register(server);
+    nvs_routes_register(server);
     register_ota_update_uri(server);
 
     // 9) Device and Alpaca Server
