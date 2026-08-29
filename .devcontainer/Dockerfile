@@ -34,7 +34,7 @@ RUN apt-get update \
        else \
          useradd --uid "${DEV_UID}" --gid "$group_name" --create-home --shell /bin/bash developer; \
        fi \
-    && mkdir -p /home/developer/.npm /home/developer/.claude /home/developer/.cache/ccache /workspace \
+    && mkdir -p /home/developer/.npm /home/developer/.claude /home/developer/.cache/ccache /home/developer/.ssh /workspace \
     && chown -R developer:"$group_name" /home/developer /workspace
 
 # Claude Code requires Node 22. Copy the pinned official Node runtime instead

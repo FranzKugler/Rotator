@@ -13,7 +13,8 @@
     "vscode": {
       "extensions": [
         "espressif.esp-idf-extension",
-        "ms-vscode.cpptools"
+        "ms-vscode.cpptools",
+        "anthropic.claude-code"
       ]
     }
   }

@@ -19,6 +19,7 @@ services:
       - npm-cache:/home/developer/.npm
       - node-modules-v1:/home/developer/node_modules
       - claude-state:/home/developer/.claude
+      - ssh-state:/home/developer/.ssh
     ports:
       - "127.0.0.1:5174:5173"
     environment:
@@ -37,3 +38,4 @@ volumes:
   npm-cache:
   node-modules-v1:
   claude-state:
+  ssh-state:

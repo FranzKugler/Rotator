@@ -9,7 +9,9 @@ State is separated as follows:
 - repository: bind-mounted at `/workspace`;
 - compiler cache: named `idf-cache` volume;
 - npm cache: named `npm-cache` volume;
-- Claude Code account and sessions: named `claude-state` volume.
+- Claude Code account and sessions: named `claude-state` volume;
+- SSH keys and known_hosts: named `ssh-state` volume, mounted at
+  `/home/developer/.ssh`.
 
 The service runs as a non-root user matching Franz's host UID/GID. It has all
 Linux capabilities dropped, `no-new-privileges`, no Docker socket, no host-home
