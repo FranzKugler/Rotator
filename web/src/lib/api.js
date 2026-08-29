@@ -32,6 +32,8 @@ export function setOtaConfig(config, fetcher = fetch) {
   return postJson('/ota/config', config, fetcher);
 }
 
+export function fetchLog(since = 0, fetcher = fetch) { return requestJson(`/log?since=${since}`, fetcher); }
+
 export function fetchExpertStatus(fetcher = fetch) { return requestJson('/expert', fetcher); }
 export function enrollExpert(password, fetcher = fetch) { return postJson('/expert/enroll', { password }, fetcher); }
 export function unlockExpert(password, fetcher = fetch) { return postJson('/expert/unlock', { password }, fetcher); }

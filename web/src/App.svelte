@@ -2,10 +2,11 @@
   import { onMount } from 'svelte';
   import AngleGauge from './lib/AngleGauge.svelte';
   import Firmware from './sections/Firmware.svelte';
+  import Debug from './sections/Debug.svelte';
   import { calibrationStream, connectAngles, postJson, requestJson } from './lib/api.js';
 
   const VERSION = __ROTATOR_VERSION__;
-  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Update'];
+  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Update', 'Debug'];
 
   let active = $state('Position');
   let menuOpen = $state(false);
@@ -254,8 +255,10 @@
         <div><h3>Calibrate angle sensor</h3><p class="hint">Measures the AS5600 error over a full calibration sequence.</p><button class="primary" disabled={angleProgress !== null} onclick={() => calibrate('/api/calibration/angle/stream', 'complete_angle', 'angle')}>Calibrate sensor</button>{#if angleProgress !== null}<div class="progress"><div class="bar" style="width: {angleProgress}%"></div></div><p class="hint">{angleProgress}%</p>{/if}</div>
       </div>
     </section>
-  {:else}
+  {:else if active === 'Update'}
     <Firmware />
+  {:else}
+    <Debug />
   {/if}
 
   {#if notice}<p class:error class="banner notice" role="status">{notice}</p>{/if}

@@ -23,6 +23,7 @@ extern "C"
 #include "ftp.h"
 #include "usb_descconfig.h"
 #include "OTAUpdate.h"
+#include "LogBuffer.h"
 }
 #include <dirent.h>
 #include <stdio.h>
@@ -76,6 +77,9 @@ AlpacaServer::Api &get_api()
 
 extern "C" void app_main(void)
 {
+    // First thing, before anything else has a chance to log: the lines from
+    // the first two seconds of boot are the ones nobody is ever watching for.
+    log_buffer_init();
 
     initArduino();
 
@@ -140,6 +144,7 @@ extern "C" void app_main(void)
     // 8) Over the Air Update registration
     expert_lock_init();
     expert_lock_register_routes(server);
+    log_buffer_register_routes(server);
     register_ota_update_uri(server);
 
     // 9) Device and Alpaca Server
