@@ -26,7 +26,10 @@ describe('OTA firmware contract', () => {
     expect(ota).toContain('HTTP_EVENT_ON_HEADER');
     expect(ota).toContain('ctx->location');
     expect(ota).toContain('.disable_auto_redirect = true');
-    expect(ota).toContain('esp_http_client_set_url(client, ctx.location)');
+    // ctx.location is cleared right after being copied out, so passing it to
+    // set_url directly (rather than the local copy) would race the next
+    // redirect's Location header against the request that is about to use it.
+    expect(ota).not.toContain('esp_http_client_set_url(client, ctx.location)');
     expect(ota).toContain('esp_http_client_set_url(client, location)');
     expect(ota).not.toContain('esp_http_client_set_redirection');
   });
