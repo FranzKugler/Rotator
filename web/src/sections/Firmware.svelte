@@ -1,17 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
-  import {
-    checkForUpdate,
-    fetchOtaStatus,
-    installUpdate,
-    setOtaConfig,
-    uploadImage,
-    fetchExpertStatus,
-    enrollExpert,
-    unlockExpert,
-    lockExpert,
-    resetExpert
-  } from '../lib/api.js';
+  import { checkForUpdate, fetchOtaStatus, installUpdate, setOtaConfig, uploadImage } from '../lib/api.js';
 
   let info = $state(null);
   let statusError = $state('');
@@ -22,9 +11,6 @@
   let phase = $state('idle');
   let progress = $state(0);
   let destroyed = false;
-  let expert = $state(null);
-  let expertPassword = $state('');
-  let expertError = $state('');
   const intervals = [0, 6, 12, 24, 72, 168];
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const busy = $derived(checking || info?.state === 'downloading' || phase === 'uploading' || phase === 'rebooting');
@@ -33,7 +19,7 @@
 
   async function load({ quiet = false } = {}) {
     try {
-      [info, expert] = await Promise.all([fetchOtaStatus(), fetchExpertStatus()]);
+      info = await fetchOtaStatus();
       statusError = '';
       return true;
     } catch (error) {
@@ -41,20 +27,6 @@
       return false;
     }
   }
-
-  async function submitExpert(event) {
-    event.preventDefault();
-    expertError = '';
-    try {
-      expert = expert.enrolled
-        ? await unlockExpert(expertPassword)
-        : await enrollExpert(expertPassword);
-      expertPassword = '';
-    } catch (error) { expertError = error.message; }
-  }
-
-  async function lock() { expert = await lockExpert(); }
-  async function reset() { expert = await resetExpert(); expertPassword = ''; }
 
   async function check() {
     checking = true;
@@ -153,40 +125,21 @@
 </section>
 
 <section class="card">
-  <h2>Expert access</h2>
-  {#if expert}
-    {#if expert.unlocked}
-      <p class="hint success">Update controls are unlocked.</p>
-      <button type="button" class="secondary" onclick={lock}>Lock again</button>
-    {:else}
-      <p class="hint">{expert.enrolled ? 'Enter the expert password to install or configure updates.' : 'Set an expert password before enabling software changes.'}</p>
-      <form onsubmit={submitExpert}>
-        <div class="field"><label for="expert-password">Password</label><input id="expert-password" type="password" bind:value={expertPassword} autocomplete={expert.enrolled ? 'current-password' : 'new-password'} /></div>
-        <button type="submit" disabled={expert.lockedOut || expertPassword.length < 6}>{expert.enrolled ? 'Unlock' : 'Set password'}</button>
-      </form>
-      {#if expert.lockedOut}<p class="banner">Too many attempts. Try again in five minutes.</p>{/if}
-      {#if expert.grace > 0 && expert.enrolled}<button type="button" class="danger" onclick={reset}>Clear forgotten password ({expert.grace}s)</button>{/if}
-    {/if}
-    {#if expertError}<p class="banner">{expertError}</p>{/if}
-  {/if}
-</section>
-
-<section class="card">
   <h2>Update source</h2>
   {#if info}
-    <div class="field"><label for="channel">Channel</label><select id="channel" value={info.channel} disabled={busy || !expert?.unlocked} onchange={(event) => configure({ channel: Number(event.currentTarget.value) })}><option value="0">Stable</option><option value="1">Edge</option></select></div>
-    <div class="field"><label for="interval">Check interval</label><select id="interval" value={info.checkInterval} disabled={busy || !expert?.unlocked} onchange={(event) => configure({ checkInterval: Number(event.currentTarget.value) })}>{#each intervals as value}<option {value}>{value === 0 ? 'Never' : `Every ${value} hours`}</option>{/each}</select></div>
-    <div class="field"><label for="auto">Automatic update</label><span class="switch"><input id="auto" type="checkbox" checked={info.autoUpdate} disabled={busy || !expert?.unlocked} onchange={(event) => configure({ autoUpdate: event.currentTarget.checked })} /><span></span></span></div>
+    <div class="field"><label for="channel">Channel</label><select id="channel" value={info.channel} disabled={busy} onchange={(event) => configure({ channel: Number(event.currentTarget.value) })}><option value={0}>Stable</option><option value={1}>Edge</option></select></div>
+    <div class="field"><label for="interval">Check interval</label><select id="interval" value={info.checkInterval} disabled={busy} onchange={(event) => configure({ checkInterval: Number(event.currentTarget.value) })}>{#each intervals as value}<option {value}>{value === 0 ? 'Never' : `Every ${value} hours`}</option>{/each}</select></div>
+    <div class="field"><label for="auto">Automatic update</label><span class="switch"><input id="auto" type="checkbox" checked={info.autoUpdate} disabled={busy} onchange={(event) => configure({ autoUpdate: event.currentTarget.checked })} /><span></span></span></div>
     <p class="hint">Automatic updates are installed between 02:00 and 05:00 after the configured check interval.</p>
     <div class="field"><span class="key">Available version</span><span>{info.availableVersion || '—'}</span></div>
     {#if info.availableNotes}<p class="hint">{info.availableNotes}</p>{/if}
     {#if info.state === 'downloading'}
       <div class="progress" role="progressbar" aria-valuenow={info.progress}><div class="bar" style="width: {info.progress}%"></div></div><p class="hint">Downloading and verifying · {info.progress}%</p>
     {:else if info.updateAvailable}
-      <button type="button" class="primary" onclick={install} disabled={busy || !expert?.unlocked}>Install now</button>
+      <button type="button" class="primary" onclick={install} disabled={busy}>Install now</button>
     {:else if info.lastCheck >= 0}<p class="hint success">The selected channel is up to date.</p>{/if}
     {#if channelError}<p class="banner">{channelError}</p>{/if}
-    <div class="field"><span class="key">{since(info.lastCheck)}</span><button type="button" class="secondary" onclick={check} disabled={busy || !expert?.unlocked}>{checking ? 'Checking…' : 'Check now'}</button></div>
+    <div class="field"><span class="key">{since(info.lastCheck)}</span><button type="button" class="secondary" onclick={check} disabled={busy}>{checking ? 'Checking…' : 'Check now'}</button></div>
   {:else}<p class="hint">Loading…</p>{/if}
 </section>
 
@@ -196,7 +149,7 @@
     <span class="key">File</span>
     <span class="filepick">
       <span class="filename" class:empty={!file}>{file ? file.name : 'No file selected'}</span>
-      <input id="image" type="file" accept=".bin,application/octet-stream" onchange={pick} disabled={busy || !expert?.unlocked} />
+      <input id="image" type="file" accept=".bin,application/octet-stream" onchange={pick} disabled={busy} />
       <label class="iconbutton" for="image" title="Choose file" aria-label="Choose file">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4L11 8h6a1.5 1.5 0 0 1 1.5 1.5V10" /><path d="M3 10h18l-2.1 7.6a1.5 1.5 0 0 1-1.45 1.4H4.5A1.5 1.5 0 0 1 3 17.5z" /></svg>
       </label>
@@ -206,12 +159,11 @@
   {#if phase === 'uploading' || phase === 'rebooting'}<div class="progress"><div class="bar" style="width: {progress}%"></div></div><p class="hint">{phase === 'uploading' ? `Writing · ${progress}%` : 'Rebooting…'}</p>{/if}
   {#if phase === 'done'}<p class="hint success">Update installed successfully.</p>{/if}
   {#if phase === 'failed'}<p class="banner">Update failed or the rotator did not return after reboot.</p>{/if}
-  <button type="button" class="primary" onclick={upload} disabled={!file || busy || !expert?.unlocked}>{busy ? 'Update running…' : 'Upload and install'}</button>
+  <button type="button" class="primary" onclick={upload} disabled={!file || busy}>{busy ? 'Update running…' : 'Upload and install'}</button>
 </section>
 
 <style>
   .progress { height: 10px; margin: .75rem 0 .25rem; border-radius: 999px; background: var(--border); overflow: hidden; }
   .bar { height: 100%; background: var(--accent); transition: width .15s linear; }
   .success { color: var(--accent); }
-  .danger { margin-top: .75rem; font: inherit; padding: .5rem 1.1rem; border: 1px solid var(--danger); border-radius: 7px; background: var(--danger-bg); color: var(--danger); cursor: pointer; }
 </style>

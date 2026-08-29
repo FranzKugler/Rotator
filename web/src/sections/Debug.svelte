@@ -185,7 +185,7 @@
   {#if error && !info}
     <p class="banner">
       {error === '{"error":"expertLocked"}'
-        ? 'Locked · unlock expert mode on the Update tab to see this.'
+        ? 'Locked · go to #expert in the address bar to unlock.'
         : `Status not available — ${error}`}
     </p>
   {:else if info}

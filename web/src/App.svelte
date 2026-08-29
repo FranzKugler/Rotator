@@ -4,12 +4,27 @@
   import Firmware from './sections/Firmware.svelte';
   import Debug from './sections/Debug.svelte';
   import Storage from './sections/Storage.svelte';
-  import { calibrationStream, connectAngles, postJson, requestJson } from './lib/api.js';
+  import Expert from './sections/Expert.svelte';
+  import { calibrationStream, connectAngles, fetchExpertStatus, postJson, requestJson } from './lib/api.js';
 
   const VERSION = __ROTATOR_VERSION__;
-  const tabs = ['Position', 'Network', 'WLAN', 'Calibration', 'Update', 'Debug', 'Storage'];
+  // The first four are always available. Update, Debug and Storage only show
+  // up once expert mode is unlocked - they are the more powerful half of this
+  // page, in the same way /log and /fs/* are the more powerful half of the API.
+  const ALL_TABS = ['Position', 'Network', 'WLAN', 'Calibration', 'Update', 'Debug', 'Storage'];
+  const OPEN_TABS = 4;
+
+  // Reached by address only - #expert has no chip of its own in the tab row,
+  // on purpose. There is nothing there for someone who has not gone looking.
+  const HASH_SCREENS = { '#expert': 'expert' };
+  const HASH_TITLES = { expert: 'Expert mode' };
 
   let active = $state('Position');
+  // Until the rotator says otherwise it is locked. That is the safe way
+  // round: an older firmware with no /expert at all answers 404, and the
+  // gated tabs stay away rather than being offered against endpoints that
+  // refuse them.
+  let expert = $state({ enrolled: false, unlocked: false, grace: 0, lockedOut: false });
   let menuOpen = $state(false);
   let navEl = $state(null);
   let notice = $state('');
@@ -37,10 +52,41 @@
     announce.timer = window.setTimeout(() => notice = '', 5000);
   }
 
+  const tabIds = $derived(expert.unlocked ? ALL_TABS : ALL_TABS.slice(0, OPEN_TABS));
+  // The chip label most of the time; the hash screen's own title otherwise -
+  // "expert" itself would be a strange word to put in a burger menu.
+  const activeLabel = $derived(tabIds.includes(active) ? active : HASH_TITLES[active]);
+
   function select(tab) {
     active = tab;
     menuOpen = false;
     if (tab === 'WLAN' && !aps.length) scan();
+    // Leave the hash behind, or reloading the page would land back on it.
+    if (location.hash) history.replaceState(null, '', location.pathname);
+  }
+
+  /**
+   * The expert screen has no chip in the tab row - #expert in the address is
+   * the way in. Re-fetched on the way in rather than reusing what is already
+   * held: the reset window is counting down, and a value read when the page
+   * loaded would be stale by minutes.
+   */
+  async function syncFromHash() {
+    const screen = HASH_SCREENS[location.hash];
+    if (!screen) return;
+    active = screen;
+    try { expert = await fetchExpertStatus(); }
+    catch { /* keep what we have */ }
+  }
+
+  /**
+   * Takes the state the rotator answered with. Locking while a gated tab is
+   * open would leave it on screen with every request behind it refused, so
+   * step back to the front.
+   */
+  function applyExpert(next) {
+    expert = next;
+    if (!next.unlocked && ALL_TABS.indexOf(active) >= OPEN_TABS) active = 'Position';
   }
 
   function onWindowKeydown(event) {
@@ -140,6 +186,10 @@
   onMount(() => {
     loadNetwork();
     loadWifiStatus();
+    fetchExpertStatus().then((next) => (expert = next)).catch(() => {
+      // Not fatal, and not a reason to unlock anything: the default above
+      // already says locked.
+    }).finally(syncFromHash);
     const socket = connectAngles((data) => {
       angle = Number(data.angle) || 0;
       mechAngle = Number(data.mechAngle) || 0;
@@ -150,7 +200,7 @@
   });
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} onpointerdown={onWindowPointerdown} />
+<svelte:window onkeydown={onWindowKeydown} onpointerdown={onWindowPointerdown} onhashchange={syncFromHash} />
 <svelte:head><title>AG2998 Camera Rotator</title><meta name="theme-color" content="#f4f5f7" /></svelte:head>
 
 <div class="app">
@@ -158,10 +208,10 @@
     <h1>AG2998 Camera Rotator</h1>
     <nav bind:this={navEl} class:open={menuOpen} aria-label="Configuration sections">
       <button type="button" class="menu-toggle" aria-expanded={menuOpen} aria-controls="tabs" onclick={() => menuOpen = !menuOpen}>
-        <span class="burger" aria-hidden="true"></span><span>{active}</span>
+        <span class="burger" aria-hidden="true"></span><span>{activeLabel}</span>
       </button>
       <div class="tabs" id="tabs">
-        {#each tabs as tab}
+        {#each tabIds as tab}
           <button type="button" aria-current={active === tab ? 'page' : undefined} onclick={() => select(tab)}>{tab}</button>
         {/each}
       </div>
@@ -260,8 +310,10 @@
     <Firmware />
   {:else if active === 'Debug'}
     <Debug />
-  {:else}
+  {:else if active === 'Storage'}
     <Storage />
+  {:else}
+    <Expert {expert} onchange={applyExpert} />
   {/if}
 
   {#if notice}<p class:error class="banner notice" role="status">{notice}</p>{/if}
