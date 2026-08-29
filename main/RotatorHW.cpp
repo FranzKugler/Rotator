@@ -30,7 +30,7 @@ static const char *TAG = "rotator";
         long int angle = 0;                      \
         for (int i = 0; i < count; i++)          \
         {                                        \
-            angle += as5600.readAngle();         \
+            angle += readAngleSafe();            \
             vTaskDelay(10 / portTICK_PERIOD_MS); \
         }                                        \
         angle / count;                           \
@@ -38,12 +38,12 @@ static const char *TAG = "rotator";
 
 #define MEASURE_PRECISE_ANGLE_DOUBLE(count) (                                  \
     {                                                                          \
-        int32_t angle = as5600.readAngle();                                    \
+        int32_t angle = readAngleSafe();                                       \
         int32_t start = angle;                                                 \
         for (int i = 1; i < count; i++)                                        \
         {                                                                      \
             vTaskDelay(10 / portTICK_PERIOD_MS);                               \
-            int32_t delta = (as5600.readAngle() - start + 6144) % 4096 - 2048; \
+            int32_t delta = (readAngleSafe() - start + 6144) % 4096 - 2048;    \
             angle += start + delta;                                            \
         }                                                                      \
         (double)angle / (double)count;                                         \
@@ -87,9 +87,13 @@ RotatorHW &RotatorHW::getInstance()
 }
 
 RotatorHW::RotatorHW()
-    : _isMoving(false), _isReverse(false), _isClockwise(true), _targetPosition(0), 
+    : _isMoving(false), _isReverse(false), _isClockwise(true), _targetPosition(0),
       serial_stream(Serial1)
 {
+    // Created here, before begin() brings up any task that could touch
+    // as5600, so readAngleSafe() never sees a null handle.
+    i2cMutex = xSemaphoreCreateMutex();
+
     auto &cfg = Configuration::getInstance();
 
     // set Fourier coefficients from config
@@ -202,6 +206,20 @@ void RotatorHW::begin()
         */
 }
 
+/**
+ * The one place allowed to touch as5600. See the declaration in RotatorHW.h
+ * for why: angle_producer_task and the homing/calibration routines below can
+ * run on different cores at once, and Wire's multi-step transaction is not
+ * safe to interleave.
+ */
+uint16_t RotatorHW::readAngleSafe()
+{
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    uint16_t value = as5600.readAngle();
+    xSemaphoreGive(i2cMutex);
+    return value;
+}
+
 void RotatorHW::gotoMechanicalZero()
 {
     ESP_LOGI(TAG, "Goto Mechanical Zero");
@@ -271,7 +289,7 @@ void RotatorHW::gotoMechanicalZero()
     int status = 0;
     for (int i = 0; i < 300 && status < 2; i++)
     {
-        int angle = CORRECTED_SENSORVALUE(as5600.readAngle());
+        int angle = CORRECTED_SENSORVALUE(readAngleSafe());
         if (status == 0 && angle == _zeroPosSensorValue)
         {
             status = 1;
@@ -440,7 +458,7 @@ void RotatorHW::calibrateAngleSensor(std::function<void(int)> onProgress)
         stepper->forwardStep();
         delay(20);
         calibrateAngleSensorStep(MEASURE_PRECISE_ANGLE_DOUBLE(64));
-        ESP_LOGI("Sensor Calibration", "Step: %3d, Sensor: %4d", i + 1, as5600.readAngle());
+        ESP_LOGI("Sensor Calibration", "Step: %3d, Sensor: %4d", i + 1, readAngleSafe());
         onProgress(100 * i / N_STEPS);
     }
     calibrateAngleSensorFinalize();

@@ -763,6 +763,12 @@ esp_err_t register_ota_update_uri(httpd_handle_t server)
     ESP_ERROR_CHECK(register_uri("/ota/install", HTTP_POST, install_handler));
     ESP_ERROR_CHECK(register_uri("/ota/config", HTTP_POST, config_handler));
     ESP_ERROR_CHECK(register_uri("/ota/upload", HTTP_POST, upload_handler));
-    xTaskCreate(periodic_task, "otaPoll", 4096, NULL, 1, NULL);
+    // fetch_manifest() alone carries two OTA_LOCATION_BUF-sized buffers on
+    // the stack (4 KB at the current 2048-byte size) before esp_http_client,
+    // the TLS handshake and cJSON add their own frames on top - 4096 was
+    // enough before OTA_LOCATION_BUF grew from 1024 to fit GitHub's longer
+    // redirect URLs, and silently isn't any more. Same size as otaInstall,
+    // which calls into the same redirect-following code.
+    xTaskCreate(periodic_task, "otaPoll", OTA_TASK_STACK, NULL, 1, NULL);
     return ESP_OK;
 }

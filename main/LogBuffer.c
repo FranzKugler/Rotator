@@ -15,16 +15,21 @@
  *
  * What it cannot hold is anything from before log_buffer_init() runs: the
  * ROM bootloader, the second stage and the partition table have all had
- * their say before app_main() does.
+ * their say before app_main() does. It also cannot hold a panic's own
+ * text - that goes straight to the UART through ESP-IDF's own ROM print
+ * path, never through esp_log_set_vprintf() - but it can hold the tail of
+ * ordinary logging that led up to one; see recover_rtc_tail() below.
  */
 #include "LogBuffer.h"
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -68,6 +73,57 @@ static uint32_t oldest_seq(void)
     return next > LOG_BUFFER_LINES ? next - LOG_BUFFER_LINES : 0;
 }
 
+// A panic's own text (the exception cause, registers, backtrace) never
+// reaches here - ESP-IDF's panic handler writes that straight to the UART
+// with its own ROM print path, bypassing esp_log_set_vprintf entirely, and
+// there is no safe way to hook that from application code. What *can* be
+// recovered is the tail of ordinary logging that led up to it, which is
+// usually enough to place the trigger even without the crash's own text.
+//
+// RTC slow memory survives a software reset or panic - only a true power
+// cycle clears it - so a small mirror of the most recent lines kept there
+// outlives exactly the resets that matter here. Nothing else on this
+// project uses RTC memory (no ULP, no deep sleep), so this is the only
+// tenant of it.
+#define RTC_TAIL_LINES 32
+#define RTC_TAIL_MAGIC 0x726f7461u // "rota"
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t count; // valid slots, saturating at RTC_TAIL_LINES
+    uint32_t next;  // slot the next line will land in
+    struct
+    {
+        uint32_t ms;
+        uint8_t level;
+        char text[LOG_BUFFER_LINE_MAX];
+    } lines[RTC_TAIL_LINES];
+} rtc_tail_t;
+
+static RTC_NOINIT_ATTR rtc_tail_t s_rtc_tail;
+
+/**
+ * Writes into the RAM ring only - see store_line() for the RTC-mirrored
+ * version. Clamps defensively rather than trusting every caller to have
+ * done it already: recover_rtc_tail() prepends a "[before restart] " marker
+ * before calling this, which can push a full-length stored line past what
+ * this ring's LOG_BUFFER_LINE_MAX-sized slots hold.
+ */
+static void ring_store(uint8_t level, uint32_t ms, const char *text, size_t length)
+{
+    if (length > LOG_BUFFER_LINE_MAX - 1) length = LOG_BUFFER_LINE_MAX - 1;
+
+    portENTER_CRITICAL_SAFE(&s_mux);
+    log_slot_t *slot = &s_slots[s_seq_next % LOG_BUFFER_LINES];
+    slot->ms = ms;
+    slot->level = level;
+    slot->text[length] = '\0';
+    memcpy(slot->text, text, length);
+    s_seq_next++;
+    portEXIT_CRITICAL_SAFE(&s_mux);
+}
+
 /**
  * Stores one line. Safe to call from either core.
  *
@@ -83,14 +139,56 @@ static void store_line(uint8_t level, const char *text, size_t length)
     if (length == 0) return;
     if (length > LOG_BUFFER_LINE_MAX - 1) length = LOG_BUFFER_LINE_MAX - 1;
 
-    portENTER_CRITICAL_SAFE(&s_mux);
-    log_slot_t *slot = &s_slots[s_seq_next % LOG_BUFFER_LINES];
-    slot->ms = (uint32_t)(esp_timer_get_time() / 1000);
-    slot->level = level;
-    slot->text[length] = '\0';
-    memcpy(slot->text, text, length);
-    s_seq_next++;
-    portEXIT_CRITICAL_SAFE(&s_mux);
+    uint32_t ms = (uint32_t)(esp_timer_get_time() / 1000);
+    ring_store(level, ms, text, length);
+
+    // Uncontended outside of this call - only ever touched from here and
+    // from the one-shot recovery in log_buffer_init(), which runs before
+    // logging starts. No lock needed for the same reason store_line()'s
+    // ring write does not need one on the read side.
+    rtc_tail_t *tail = &s_rtc_tail;
+    if (tail->magic != RTC_TAIL_MAGIC || tail->count > RTC_TAIL_LINES || tail->next >= RTC_TAIL_LINES)
+    {
+        tail->magic = RTC_TAIL_MAGIC;
+        tail->count = 0;
+        tail->next = 0;
+    }
+    tail->lines[tail->next].ms = ms;
+    tail->lines[tail->next].level = level;
+    memcpy(tail->lines[tail->next].text, text, length);
+    tail->lines[tail->next].text[length] = '\0';
+    tail->next = (tail->next + 1) % RTC_TAIL_LINES;
+    if (tail->count < RTC_TAIL_LINES) tail->count++;
+}
+
+/**
+ * Replays whatever the RTC tail holds from before this boot into the fresh
+ * ring, oldest first, each line marked so it reads as history rather than
+ * as something happening now. Called once, before esp_log_set_vprintf() is
+ * hooked, so nothing can be logged - and so mirrored into the tail - while
+ * this reads it.
+ *
+ * A garbage magic value means either the first boot ever or a true power
+ * cycle, both of which mean there is nothing to recover; silently doing
+ * nothing is the correct answer for both.
+ */
+static void recover_rtc_tail(void)
+{
+    rtc_tail_t *tail = &s_rtc_tail;
+    if (tail->magic != RTC_TAIL_MAGIC || tail->count == 0 ||
+        tail->count > RTC_TAIL_LINES || tail->next >= RTC_TAIL_LINES) return;
+
+    bool wrapped = tail->count == RTC_TAIL_LINES;
+    size_t start = wrapped ? tail->next : 0;
+    for (size_t i = 0; i < tail->count; i++)
+    {
+        size_t idx = (start + i) % RTC_TAIL_LINES;
+        char marked[LOG_BUFFER_LINE_MAX + 20];
+        int written = snprintf(marked, sizeof(marked), "[before restart] %s", tail->lines[idx].text);
+        size_t length = written < 0 ? 0 : (size_t)written;
+        if (length >= sizeof(marked)) length = sizeof(marked) - 1;
+        ring_store(tail->lines[idx].level, tail->lines[idx].ms, marked, length);
+    }
 }
 
 /** ESP-IDF's level letter, kept as a field rather than parsed again in the browser. */
@@ -180,6 +278,7 @@ static int capture_vprintf(const char *format, va_list args)
 
 void log_buffer_init(void)
 {
+    recover_rtc_tail();
     s_chained_vprintf = esp_log_set_vprintf(capture_vprintf);
 }
 
