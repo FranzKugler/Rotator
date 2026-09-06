@@ -42,4 +42,16 @@ describe('QlockThreeW32-compatible shell', () => {
     expect(app).toMatch(/\.network-fields[\s\S]*grid-template-columns:\s*1fr/);
     expect(app).toMatch(/\.network-fields input[\s\S]*width:\s*100%/);
   });
+
+  it('shows a live sensor/motor debug panel on the Calibration tab', () => {
+    expect(app).toContain('<h2>Live sensor</h2>');
+    for (const label of ['Raw sensor', 'Corrected sensor', 'Motor step position', 'Hall sensor']) {
+      expect(app).toContain(`>${label}<`);
+    }
+  });
+
+  it('reports the residual quality returned by an angle sensor calibration', () => {
+    expect(app).toContain('result.residualAfterDeg');
+    expect(app).toContain('result.residualBeforeDeg');
+  });
 });

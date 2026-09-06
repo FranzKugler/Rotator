@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 static const char *TAG = "rotator";
 
@@ -93,13 +94,13 @@ RotatorHW::RotatorHW()
     // Created here, before begin() brings up any task that could touch
     // as5600, so readAngleSafe() never sees a null handle.
     i2cMutex = xSemaphoreCreateMutex();
+    stepperMutex = xSemaphoreCreateMutex();
 
     auto &cfg = Configuration::getInstance();
 
     // set Fourier coefficients from config
     for (int k = 0; k <= KMAX; k++)
     {
-        delta_phi[k] = 2.0 * M_PI * k / N_STEPS;
         A[k] = cfg.getA(k);
         B[k] = cfg.getB(k);
     }
@@ -220,6 +221,29 @@ uint16_t RotatorHW::readAngleSafe()
     return value;
 }
 
+/**
+ * The only synchronized access to the stepper's position counter. See the
+ * declaration in RotatorHW.h for why: FastAccelStepper's ESP32 backend pairs
+ * a PCNT hardware register with a software overflow-extension word, and
+ * setCurrentPosition() has to update both - a getCurrentPosition() from
+ * another task caught mid-update can read an inconsistent combination of the
+ * two.
+ */
+int32_t RotatorHW::getStepPositionSafe()
+{
+    xSemaphoreTake(stepperMutex, portMAX_DELAY);
+    int32_t position = stepper->getCurrentPosition();
+    xSemaphoreGive(stepperMutex);
+    return position;
+}
+
+void RotatorHW::setStepPositionSafe(int32_t newPosition)
+{
+    xSemaphoreTake(stepperMutex, portMAX_DELAY);
+    stepper->setCurrentPosition(newPosition);
+    xSemaphoreGive(stepperMutex);
+}
+
 void RotatorHW::gotoMechanicalZero()
 {
     ESP_LOGI(TAG, "Goto Mechanical Zero");
@@ -310,8 +334,8 @@ void RotatorHW::gotoMechanicalZero()
     MOVETO_WAIT((firstEdge + secondEdge) / 2);
     _zeroPosSensorOffset = CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(256));
 
-    ESP_LOGI("TAG", "Sensor at mechanical Zero = %f, Motor position before reset = %ld", _zeroPosSensorOffset, stepper->getCurrentPosition());
-    stepper->setCurrentPosition(0);
+    ESP_LOGI("TAG", "Sensor at mechanical Zero = %f, Motor position before reset = %ld", _zeroPosSensorOffset, getStepPositionSafe());
+    setStepPositionSafe(0);
 
     /*
     // assuming that we're still in the Hallsensor "window", find the CCW magnetic edge
@@ -446,29 +470,88 @@ void RotatorHW::findEdge(bool dirCW)
 }
 
 //void RotatorHW::calibrateAngleSensor(void)
-void RotatorHW::calibrateAngleSensor(std::function<void(int)> onProgress)
+RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(int)> onProgress)
 {
+    // Sweep this many full motor revolutions and average the (wrapped) error
+    // at each step index before fitting. This trades calibration time for
+    // less read/motor noise in the fit; bump it if the reported residual
+    // still looks noisy. Confirmed clean on the bench at 2 repeats (residual
+    // RMS ~1 degree, consistent across two separate runs) with the full-step
+    // motion below.
+    //
+    // Two other approaches were tried live and rejected - not because of
+    // CAL_REPEATS, but because both replaced the full-step motion itself:
+    // a variant that switched the driver to full-step mode as below but then
+    // tried to rescale FastAccelStepper's position counter afterwards via one
+    // large setCurrentPosition() jump corrupted that counter outright (its
+    // internal 16-bit position reconstruction does not tolerate a jump that
+    // size); a variant that avoided the rescale by moving MICROSTEPS pulses
+    // at the normal driver resolution instead of switching to full-step mode
+    // measured a materially worse fit even at a single repeat. Both are
+    // symptoms of a deeper, still-unresolved cross-task reliability issue
+    // between FastAccelStepper's move()/isRunning() and the 100 ms
+    // angle_producer_task reading the same object - not something to keep
+    // patching blind. The known, accepted cost of leaving that alone: this
+    // full-step sweep runs the driver at a different microstep resolution
+    // than FastAccelStepper's position counter assumes, so the counter
+    // undercounts by up to 256x for the duration of the sweep and is left
+    // that way afterwards - gotoMechanicalZero() must be re-run after any
+    // calibration before trusting absolute position commands, which is
+    // already required anyway (recalibrating shifts the sensor correction's
+    // C0 offset, invalidating the stored mechanical-zero reference).
+    constexpr int CAL_REPEATS = 2;
+
     // set driver to fullsteps
     stepper_driver.setMicrostepsPerStep(1);
 
+    // Accumulate the *wrapped error against the ideal ramp* per step index,
+    // not the raw counts themselves - averaging raw counts directly would
+    // break near the 0/4096 wraparound whenever it falls inside the sweep.
+    std::vector<double> avgErr(N_STEPS, 0.0);
+    for (int r = 0; r < CAL_REPEATS; r++)
+    {
+        for (int i = 0; i < N_STEPS; i++)
+        {
+            // one fullstep, measure sensor angle
+            stepper->forwardStep();
+            delay(20);
+            double raw = FMOD4096(MEASURE_PRECISE_ANGLE_DOUBLE(64));
+            double ideal = 4096.0 * i / N_STEPS;
+            double err = raw - ideal;
+            err -= 4096.0 * std::round(err / 4096.0); // wrap to (-2048, 2048]
+            avgErr[i] += err;
+            ESP_LOGI("Sensor Calibration", "Rev %d/%d, Step: %3d, Sensor: %.1f", r + 1, CAL_REPEATS, i + 1, raw);
+            onProgress(100 * (r * N_STEPS + i) / (CAL_REPEATS * N_STEPS));
+        }
+    }
+    std::vector<double> avgRaw(N_STEPS);
+    for (int i = 0; i < N_STEPS; i++)
+        avgRaw[i] = 4096.0 * i / N_STEPS + avgErr[i] / CAL_REPEATS;
+
+    // how good were the coefficients already in effect, judged against this
+    // fresh sweep? (uses C0/A/B as they stand before calibrateAngleSensorFinalize
+    // overwrites them below)
+    ResidualStats before = computeResidual(avgRaw);
+
     calibrateAngleSensorInit();
     for (int i = 0; i < N_STEPS; i++)
-    {
-        // one fullstep, measure sensor angle and send it to our algorithm computing the Fouries coefficients
-        stepper->forwardStep();
-        delay(20);
-        calibrateAngleSensorStep(MEASURE_PRECISE_ANGLE_DOUBLE(64));
-        ESP_LOGI("Sensor Calibration", "Step: %3d, Sensor: %4d", i + 1, readAngleSafe());
-        onProgress(100 * i / N_STEPS);
-    }
+        calibrateAngleSensorStep(avgRaw[i]);
     calibrateAngleSensorFinalize();
+
+    ResidualStats after = computeResidual(avgRaw);
+
     ESP_LOGI("Sensor Calibration", "C0 = %.4f", C0);
     for (int k = 1; k <= KMAX; k++)
     {
         ESP_LOGI("Sensor Calibration", "A%d = %.4f, B%d = %.4f", k, A[k], k, B[k]);
     }
+    ESP_LOGI("Sensor Calibration", "Residual RMS: before=%.4f deg, after=%.4f deg (peak after=%.4f deg)",
+             before.rmsDeg, after.rmsDeg, after.peakDeg);
 
-    // store new values in configuration
+    // store new values in configuration and persist them - previously these
+    // were only written to the in-memory ConfigData (all setters called with
+    // save=false and nothing ever called save() afterwards), so a
+    // calibration run was silently lost on the next restart.
     auto &cfg = Configuration::getInstance();
     for (int k = 0; k <= KMAX; k++)
     {
@@ -476,9 +559,12 @@ void RotatorHW::calibrateAngleSensor(std::function<void(int)> onProgress)
         cfg.setB(k, B[k], false);
     }
     cfg.setC0(C0, false);
+    cfg.save();
 
     // set driver back to 256 microsteps
     stepper_driver.setMicrostepsPerStep(256);
+
+    return {before.rmsDeg, after.rmsDeg, after.peakDeg};
 }
 
 void RotatorHW::calibrateAngleSensorInit(void)
@@ -490,7 +576,6 @@ void RotatorHW::calibrateAngleSensorInit(void)
     {
         sumC[k] = 0;
         sumS[k] = 0;
-        phi[k] = 0;
     }
 }
 
@@ -508,16 +593,19 @@ void RotatorHW::calibrateAngleSensorStep(double sensor_raw)
     // 3) sum offsets
     sum0 += e;
 
-    // 4) sum up harmonic parts 
+    // 4) sum up harmonic parts, correlated against the *actually measured*
+    // angle - not an angle accumulated from the step index. correctSensorReading()
+    // evaluates cos(k*theta)/sin(k*theta) at the raw reading it is given, so the
+    // fit has to use that same theta or the harmonics come out phase-rotated by
+    // (this run's starting angle) * k as soon as a calibration run does not
+    // happen to start at sensor_raw == 0. That is what produced a ~50 degree
+    // "before" residual on a run started away from raw 0: the old fit's basis
+    // was anchored to step 0 rather than to the sensor's own zero.
+    double theta = 2.0 * M_PI * sensor_raw / 4096.0;
     for (int k = 1; k <= KMAX; ++k)
     {
-        double c = cos(phi[k]);
-        double s = sin(phi[k]);
-        sumC[k] += e * c;
-        sumS[k] += e * s;
-        phi[k] += delta_phi[k];
-        if (phi[k] >= 2.0f * M_PI)
-            phi[k] -= 2.0f * M_PI;
+        sumC[k] += e * cos(k * theta);
+        sumS[k] += e * sin(k * theta);
     }
 
     step_counter++;
@@ -537,6 +625,23 @@ void RotatorHW::calibrateAngleSensorFinalize(void)
         A[k] = 2.0 * sumC[k] / N_STEPS;
         B[k] = 2.0 * sumS[k] / N_STEPS;
     }
+}
+
+RotatorHW::ResidualStats RotatorHW::computeResidual(const std::vector<double> &avgRaw)
+{
+    constexpr double DEG_PER_COUNT = 360.0 / 4096.0;
+    double sumSq = 0.0;
+    double peak = 0.0;
+    for (int i = 0; i < N_STEPS; i++)
+    {
+        double ideal = 4096.0 * i / N_STEPS;
+        double err = correctSensorReading(avgRaw[i]) - ideal;
+        err -= 4096.0 * std::round(err / 4096.0); // wrap to (-2048, 2048]
+        sumSq += err * err;
+        peak = std::max(peak, std::fabs(err));
+    }
+    double rmsCounts = std::sqrt(sumSq / N_STEPS);
+    return {rmsCounts * DEG_PER_COUNT, peak * DEG_PER_COUNT};
 }
 
 double RotatorHW::correctSensorReading(double sensorReading)
@@ -603,6 +708,17 @@ void RotatorHW::ekf_update(double s_raw)
     ESP_LOGI("------", "h (Sensor Digits):  %7.2f, y: %7f", h, y);
 }
 
+RotatorHW::SensorSnapshot RotatorHW::getSensorSnapshot()
+{
+    uint16_t raw = readAngleSafe();
+    return {
+        raw,
+        correctSensorReading(raw),
+        getStepPositionSafe(),
+        !digitalRead(HALLSENSOR), // active-low
+    };
+}
+
 void RotatorHW::putHalt()
 {
     // halt only if we're moving
@@ -620,13 +736,13 @@ double RotatorHW::getPosition()
 {
     // get a snapshot of the actual position based on the stepper position and convert it to actual position
     //return FMOD360(stepper->getCurrentPosition() * DEGREE_PER_STEP + positionOffsetToMechanicalPosition);
-    return 36 * std::floor(FMOD360(stepper->getCurrentPosition() * DEGREE_PER_STEP) / 36 ) +  FMOD4096(correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(64))-_zeroPosSensorValue) / 4096.0 * 36.0 +  positionOffsetToMechanicalPosition;
+    return 36 * std::floor(FMOD360(getStepPositionSafe() * DEGREE_PER_STEP) / 36 ) +  FMOD4096(correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(64))-_zeroPosSensorValue) / 4096.0 * 36.0 +  positionOffsetToMechanicalPosition;
 }
 
 double RotatorHW::getMechanicalPosition()
 {
     // get a snapshot of the actual position based on the stepper position
-    return (double)FMOD360(stepper->getCurrentPosition() * DEGREE_PER_STEP);
+    return (double)FMOD360(getStepPositionSafe() * DEGREE_PER_STEP);
     
 }
 

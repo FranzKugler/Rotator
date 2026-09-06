@@ -44,6 +44,10 @@
   let scanBusy = $state(false);
   let zeroProgress = $state(null);
   let angleProgress = $state(null);
+  let rawSensor = $state(0);
+  let correctedSensor = $state(0);
+  let stepPosition = $state(0);
+  let hallActive = $state(false);
 
   function announce(message, failed = false) {
     notice = message;
@@ -173,8 +177,21 @@
     calibrationStream(path, completeEvent, {
       progress(value) { if (kind === 'zero') zeroProgress = value; else angleProgress = value; },
       complete(value) {
-        if (kind === 'zero') zeroProgress = null; else angleProgress = null;
-        announce(kind === 'zero' ? `Mechanical zero: ${value}` : 'Angle sensor calibrated');
+        if (kind === 'zero') {
+          zeroProgress = null;
+          announce(`Mechanical zero: ${value}`);
+          return;
+        }
+        angleProgress = null;
+        try {
+          const result = JSON.parse(value);
+          announce(
+            `Angle sensor calibrated · residual ${result.residualAfterDeg.toFixed(3)}° RMS ` +
+            `(was ${result.residualBeforeDeg.toFixed(3)}°, peak ${result.peakAfterDeg.toFixed(3)}°)`
+          );
+        } catch {
+          announce('Angle sensor calibrated');
+        }
       },
       error() {
         if (kind === 'zero') zeroProgress = null; else angleProgress = null;
@@ -194,6 +211,10 @@
       angle = Number(data.angle) || 0;
       mechAngle = Number(data.mechAngle) || 0;
       direction = data.direction === 'ccw' ? 'ccw' : 'cw';
+      rawSensor = Number(data.rawSensor) || 0;
+      correctedSensor = Number(data.correctedSensor) || 0;
+      stepPosition = Number(data.stepPosition) || 0;
+      hallActive = Boolean(data.hall);
     });
     socket.addEventListener('error', () => announce('Live angle connection unavailable', true));
     return () => socket.close();
@@ -298,6 +319,15 @@
       {#if wifiStatus}<p class="hint success">{wifiStatus}</p>{/if}
     </section>
   {:else if active === 'Calibration'}
+    <section class="card">
+      <h2>Live sensor</h2>
+      <p class="hint">Raw AS5600 reading and step position, refreshed live - useful while jogging the rotator by hand or judging a calibration run.</p>
+      <div class="field"><span class="key">Raw sensor</span><span>{rawSensor} / 4096</span></div>
+      <div class="field"><span class="key">Corrected sensor</span><span>{correctedSensor.toFixed(1)} / 4096</span></div>
+      <div class="field"><span class="key">Motor step position</span><span>{stepPosition}</span></div>
+      <div class="field"><span class="key">Hall sensor</span><span>{hallActive ? 'Active (at magnet)' : 'Inactive'}</span></div>
+    </section>
+
     <section class="card">
       <h2>Mechanical reference</h2>
       <p class="banner warning">These operations move the rotator. Make sure the mechanism can travel safely before starting.</p>

@@ -84,9 +84,15 @@ void angle_producer_task(void *)
 {
     while (true)
     {
-        latest.angle = RotatorHW::getInstance().getPosition();
-        latest.mechAngle = RotatorHW::getInstance().getMechanicalPosition();
-        latest.direction = RotatorHW::getInstance().getDirection();
+        auto &rotator = RotatorHW::getInstance();
+        latest.angle = rotator.getPosition();
+        latest.mechAngle = rotator.getMechanicalPosition();
+        latest.direction = rotator.getDirection();
+        auto snapshot = rotator.getSensorSnapshot();
+        latest.rawSensor = snapshot.rawSensor;
+        latest.correctedSensor = snapshot.correctedSensor;
+        latest.stepPosition = snapshot.stepPosition;
+        latest.hall = snapshot.hall;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -95,10 +101,13 @@ void angle_event_broadcast(void *)
 {
     while (true) {
         // JSON bauen
-        char buf[64];
+        char buf[192];
         int len = snprintf(buf, sizeof(buf),
-            "{\"angle\":%.2f,\"mechAngle\":%.2f,\"direction\":\"%s\"}",
-            latest.angle, latest.mechAngle, latest.direction ? "cw" : "ccw");
+            "{\"angle\":%.2f,\"mechAngle\":%.2f,\"direction\":\"%s\","
+            "\"rawSensor\":%u,\"correctedSensor\":%.2f,\"stepPosition\":%ld,\"hall\":%s}",
+            latest.angle, latest.mechAngle, latest.direction ? "cw" : "ccw",
+            latest.rawSensor, latest.correctedSensor, (long)latest.stepPosition,
+            latest.hall ? "true" : "false");
 
         // Frame komplett initialisieren
         httpd_ws_frame_t pkt;
@@ -327,7 +336,7 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Connection", "keep-alive");
 
-    char buf[64];
+    char buf[256];
     auto send_event = [&](const char *evt, const char *data)
     {
         int len = snprintf(buf, sizeof(buf),
@@ -336,14 +345,18 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
         vTaskDelay(pdMS_TO_TICKS(10));
     };
 
-    RotatorHW::getInstance().calibrateAngleSensor(
+    RotatorHW::CalibrationResult result = RotatorHW::getInstance().calibrateAngleSensor(
         [&](int pct)
         {
             char d[8];
             snprintf(d, sizeof(d), "%d", pct);
             send_event("progress", d);
         });
-    send_event("complete_angle", "0");
+    char resultJson[128];
+    snprintf(resultJson, sizeof(resultJson),
+             "{\"residualBeforeDeg\":%.4f,\"residualAfterDeg\":%.4f,\"peakAfterDeg\":%.4f}",
+             result.residualBeforeDeg, result.residualAfterDeg, result.peakAfterDeg);
+    send_event("complete_angle", resultJson);
 
     httpd_resp_send_chunk(req, nullptr, 0);
     return ESP_OK;

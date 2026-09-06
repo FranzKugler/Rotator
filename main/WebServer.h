@@ -12,6 +12,13 @@ extern "C"
         double angle;
         double mechAngle;
         double direction;
+        // Fast, unaveraged debug fields - for watching sensor/motor behaviour
+        // live (e.g. while jogging or judging a calibration run), not for
+        // precise position math.
+        uint16_t rawSensor;
+        double correctedSensor;
+        int32_t stepPosition;
+        bool hall;
     };
 
     //extern QueueHandle_t angleUpdateQueue;

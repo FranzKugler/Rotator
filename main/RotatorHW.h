@@ -8,6 +8,7 @@
 #include "Wire.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <vector>
 
 #define N_STEPS 400 // No of fullsteps for calibration
 #define KMAX 4      // up to KMAX Fourier coefficients
@@ -20,6 +21,30 @@ public:
     RotatorHW();
 
     void begin(); // call in setup()
+
+    // Fast (single-sample) readout for live debug/UI use - unlike getPosition(),
+    // this does not average 64 samples, so it is cheap enough to poll at a UI
+    // refresh rate.
+    struct SensorSnapshot
+    {
+        uint16_t rawSensor;
+        double correctedSensor;
+        int32_t stepPosition;
+        bool hall; // true = magnet detected (sensor is active-low)
+    };
+    SensorSnapshot getSensorSnapshot();
+
+    // Quality metrics from a calibrateAngleSensor() run, in degrees of
+    // AS5600 error. "Before" is measured against the coefficients that were
+    // in effect when the run started, "after" against the freshly fitted
+    // ones - both against the same fresh sweep, so they are directly
+    // comparable.
+    struct CalibrationResult
+    {
+        double residualBeforeDeg;
+        double residualAfterDeg;
+        double peakAfterDeg;
+    };
 
     // external accessors
     bool getIsMoving()
@@ -49,7 +74,7 @@ public:
     // void measureMechanicalZero(int noOfMeasures = 1);
     void findEdge(bool dir);
     // void calibrateAngleSensor(void);
-    void calibrateAngleSensor(std::function<void(int)> onProgress);
+    CalibrationResult calibrateAngleSensor(std::function<void(int)> onProgress);
     double correctSensorReading(double sensorReading);
     // void fitSinusoidalErrorFromSteps(const std::vector<double> &y, int N, double &out_amplitude, double &out_phase);
     void putHalt();
@@ -69,10 +94,32 @@ private:
     // minutes after every boot before this existed.
     uint16_t readAngleSafe();
 
+    // Same idea, for FastAccelStepper's position counter: angle_producer_task
+    // reads it every 100 ms via getPosition()/getMechanicalPosition()/
+    // getSensorSnapshot() while homing/calibration call setCurrentPosition()
+    // to redefine the reference from a different task. On this ESP32 target
+    // FastAccelStepper backs the counter with a PCNT hardware register plus a
+    // software overflow-extension word; setCurrentPosition() has to update
+    // both, and a concurrent read caught mid-update can see an inconsistent
+    // combination of the two. That is what turned a calibration run's
+    // position rescale into a nonsense multi-million-step reading on the
+    // bench - not the rescale arithmetic itself.
+    int32_t getStepPositionSafe();
+    void setStepPositionSafe(int32_t newPosition);
+
     // sensor calibration
     void calibrateAngleSensorInit(void);
     void calibrateAngleSensorStep(double sensor_raw);
     void calibrateAngleSensorFinalize(void);
+    struct ResidualStats
+    {
+        double rmsDeg;
+        double peakDeg;
+    };
+    // RMS/peak error of the *currently active* correction (whatever is in
+    // C0/A/B right now) against a sweep of averaged raw readings indexed by
+    // ideal step position.
+    ResidualStats computeResidual(const std::vector<double> &avgRaw);
     // EKF functions
     double h_meas(double x);
     double H_jacobian(double x);
@@ -99,8 +146,6 @@ private:
     double sumC[KMAX + 1];
     double sumS[KMAX + 1];
     double sum0;
-    double phi[KMAX + 1];
-    double delta_phi[KMAX + 1];
     double C0;
     double A[KMAX + 1];
     double B[KMAX + 1];
@@ -120,6 +165,7 @@ private:
     // Instantiate Rotary Sensor
     AS5600 as5600; //  use default Wire
     SemaphoreHandle_t i2cMutex;
+    SemaphoreHandle_t stepperMutex;
     // Instantiate the AccelStepper Library and bind it to our TMC2209
     // AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
     FastAccelStepperEngine engine;
