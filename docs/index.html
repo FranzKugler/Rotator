@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AG2998 Rotator — Flash a rotator</title>
+<meta name="description" content="Flash a blank Seeed XIAO ESP32-S3 with AG2998 Rotator firmware, straight from Chrome or Edge — no ESP-IDF toolchain to install.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+  /* The same tokens as web/src/app.css, so the page somebody flashes from and
+     the interface they land on afterwards are recognisably one thing. Copied
+     rather than imported: this page is served from GitHub Pages and must not
+     depend on anything in the firmware image. */
+  :root {
+    --bg: #f4f5f7;
+    --surface: #ffffff;
+    --text: #1c1f23;
+    --muted: #6b7280;
+    --border: #d9dce1;
+    --accent: #3b6ea5;
+    --accent-text: #ffffff;
+    --danger: #b3261e;
+    --danger-bg: #fdecea;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c;
+      --surface: #1f2228;
+      --text: #e6e8eb;
+      --muted: #9aa1ab;
+      --border: #343941;
+      --accent: #6ea8dc;
+      --accent-text: #10131a;
+      --danger: #f2b8b5;
+      --danger-bg: #3b1f1d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main {
+    max-width: 40rem;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+  header.hero {
+    text-align: center;
+    margin-bottom: 2.5rem;
+  }
+  .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin: 0 0 0.6rem;
+  }
+  h1 {
+    font-size: 1.9rem;
+    margin: 0 0 0.7rem;
+    text-wrap: balance;
+  }
+  .lede {
+    color: var(--muted);
+    font-size: 1.05rem;
+    max-width: 32rem;
+    margin: 0 auto;
+  }
+  /* No product photo yet - a small abstract mark (the rotation ring, zero
+     tick and angle pointer from favicon.svg) rather than a hero image
+     standing in for one. */
+  .mark {
+    display: block;
+    width: 4.5rem;
+    height: 4.5rem;
+    margin: 1.6rem auto 0;
+    border-radius: 22%;
+  }
+
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.4rem 1.5rem;
+    margin-bottom: 1.25rem;
+  }
+  h2 {
+    font-size: 1.05rem;
+    margin: 0 0 0.7rem;
+  }
+  p { margin: 0.5rem 0; }
+  ul, ol { margin: 0.5rem 0; padding-left: 1.3rem; }
+  li { margin: 0.3rem 0; }
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.88em;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05em 0.35em;
+  }
+  a { color: var(--accent); }
+
+  .requirements {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.4rem;
+    list-style: none;
+    padding: 0;
+    font-size: 0.92rem;
+  }
+  .requirements li { display: flex; align-items: center; gap: 0.4rem; margin: 0; }
+  .requirements li::before { content: "✓"; color: var(--accent); font-weight: 700; }
+
+  .install-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.8rem;
+    text-align: center;
+    padding: 1.8rem 1.5rem;
+  }
+  esp-web-install-button { display: block; }
+  button[slot="activate"] {
+    font: inherit;
+    font-size: 1.05rem;
+    font-weight: 600;
+    padding: 0.85rem 2rem;
+    border-radius: 999px;
+    border: none;
+    background: var(--accent);
+    color: var(--accent-text);
+    cursor: pointer;
+  }
+  button[slot="activate"]:hover { filter: brightness(1.08); }
+  .unsupported, .not-allowed {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border-radius: var(--radius);
+    padding: 0.9rem 1.1rem;
+    font-size: 0.92rem;
+    max-width: 26rem;
+  }
+  .version {
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .steps { counter-reset: step; }
+  .steps li {
+    list-style: none;
+    position: relative;
+    padding-left: 2.1rem;
+    margin: 0.7rem 0;
+  }
+  .steps li::before {
+    counter-increment: step;
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  .caution {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border-radius: var(--radius);
+    padding: 0.7rem 1rem;
+    font-size: 0.9rem;
+    margin: 0.7rem 0 0;
+  }
+
+  details summary {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.2rem 0;
+  }
+  details[open] summary { margin-bottom: 0.5rem; }
+
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-top: 2rem;
+  }
+  footer a { color: inherit; }
+</style>
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <p class="eyebrow">AG2998 Rotator</p>
+    <h1>Flash a rotator, from the browser</h1>
+    <p class="lede">
+      A blank <a href="https://github.com/FranzKugler/Rotator">Seeed XIAO
+      ESP32-S3 (16&nbsp;MB flash)</a> is ready in about a minute — no ESP-IDF
+      toolchain, no dev container, nothing to install. This page writes the
+      whole flash: bootloader, partition table, firmware and browser
+      interface, in one go.
+    </p>
+    <img class="mark" src="favicon.svg" width="64" height="64" alt="">
+  </header>
+
+  <section>
+    <h2>Before you start</h2>
+    <ul class="requirements">
+      <li>Chrome, Edge or Opera on a computer</li>
+      <li>A USB-C cable that carries data</li>
+      <li>A Seeed XIAO ESP32-S3 (16&nbsp;MB flash)</li>
+    </ul>
+    <p style="margin-top:0.9rem;">
+      Safari and Firefox cannot do this — they have no Web Serial API. On a
+      phone or tablet there is no port to connect to at all.
+    </p>
+  </section>
+
+  <section class="install-row">
+    <esp-web-install-button manifest="firmware/esp-web-tools-manifest.json">
+      <button slot="activate">Connect and install</button>
+      <span slot="unsupported" class="unsupported">
+        This browser cannot flash a device — open this page in Chrome, Edge or
+        Opera on a desktop instead.
+      </span>
+      <span slot="not-allowed" class="not-allowed">
+        Web Serial needs a secure connection. This page should already be
+        HTTPS — if you are seeing this, something in between is stripping it.
+      </span>
+    </esp-web-install-button>
+    <span class="version" id="version"></span>
+  </section>
+
+  <section>
+    <h2>If the browser cannot find the board</h2>
+    <p>
+      The XIAO's own USB port is not a classic USB-serial bridge, so it does
+      not always drop into the bootloader by itself. If "Connect" shows no
+      port, or the install stalls right at the start:
+    </p>
+    <ol class="steps">
+      <li>Unplug the USB cable.</li>
+      <li>Hold the board's <strong>BOOT</strong> button down.</li>
+      <li>Plug the cable back in while still holding it, then let go.</li>
+      <li>Click "Connect and install" again.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>After it's flashed</h2>
+    <p>
+      The rotator reboots and, over the same USB-C cable, presents a USB
+      network interface at <code>http://192.168.7.1</code> — no Wi-Fi is
+      configured yet, so this is the only way in at first. Open that address
+      to see the rotator's own interface; the Wi-Fi tab there can join it to
+      a network, after which it also answers at
+      <code>http://ag2998-rotator.local</code>. Update, Debug and Storage sit
+      behind a password you set once at
+      <code>http://192.168.7.1/#expert</code>.
+    </p>
+    <p class="caution">
+      On every boot the rotator turns to find its mechanical zero against the
+      Hall sensor before it does anything else — keep the optics clear before
+      powering it on.
+    </p>
+  </section>
+
+  <details>
+    <summary>What exactly does this write?</summary>
+    <p>
+      Five parts, at the offsets a factory-fresh XIAO ESP32-S3 needs: the
+      second-stage bootloader, the partition table, the tiny stub that tells
+      it which app partition to boot first, the firmware itself, and the
+      filesystem image holding the browser interface. The "erase" option this
+      tool offers first clears the whole chip, which is the safe default for
+      a board that has never run this firmware before — and the right choice
+      if the partition table has changed since it last did. Reflashing a
+      rotator that is already running this firmware does not need any of
+      this: use its own Update tab instead, which only ever replaces the two
+      halves that actually changed. Built straight from
+      <a href="https://github.com/FranzKugler/Rotator/releases/latest">the
+      latest stable release</a>; see
+      <a href="https://github.com/FranzKugler/Rotator/blob/main/CLAUDE.md">CLAUDE.md</a>
+      for how the firmware itself is put together.
+    </p>
+  </details>
+
+  <footer>
+    <a href="https://github.com/FranzKugler/Rotator">FranzKugler/Rotator</a>
+  </footer>
+</main>
+<script type="module">
+  fetch("firmware/esp-web-tools-manifest.json")
+    .then((response) => (response.ok ? response.json() : null))
+    .then((manifest) => {
+      if (manifest?.version) {
+        document.getElementById("version").textContent = `Version ${manifest.version}`;
+      }
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>

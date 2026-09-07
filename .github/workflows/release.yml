@@ -16,6 +16,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -100,6 +102,21 @@ jobs:
             --notes-file notes.md \
             build/Rotator.bin build/littlefs.bin manifest.json
 
+      # Only for stable: first-time flashing a blank chip wants the reviewed
+      # release, and the flashing page always points at whichever stable
+      # release last deployed it. This needs three parts a running rotator's
+      # own OTA update never touches - the bootloader, the partition table
+      # and the otadata stub that picks the factory partition to boot first -
+      # alongside the firmware and filesystem image already built above.
+      - name: Write the ESP Web Tools manifest
+        if: steps.meta.outputs.channel == 'stable'
+        run: |
+          python3 scripts/web_tools_manifest.py \
+            --version "${{ steps.meta.outputs.version }}" \
+            --base-url . \
+            --out esp-web-tools-manifest.json \
+            build
+
       - name: Publish stable release
         if: steps.meta.outputs.channel == 'stable'
         env:
@@ -108,7 +125,33 @@ jobs:
           gh release create "${{ steps.meta.outputs.tag }}" \
             --title "${{ steps.meta.outputs.tag }}" \
             --generate-notes \
-            build/Rotator.bin build/littlefs.bin manifest.json
+            build/Rotator.bin build/littlefs.bin manifest.json \
+            build/bootloader/bootloader.bin build/partition_table/partition-table.bin \
+            build/ota_data_initial.bin esp-web-tools-manifest.json
+
+      # A browser fetch() of a GitHub release asset has no CORS header and is
+      # silently blocked, so docs/index.html cannot point at /releases/ the
+      # way a rotator's own OTA manifest does - the flashing page and its five
+      # images have to be served from the same origin instead.
+      - name: Stage the flashing page
+        if: steps.meta.outputs.channel == 'stable'
+        run: |
+          mkdir -p pages/firmware
+          cp -r docs/. pages/
+          cp build/bootloader/bootloader.bin build/partition_table/partition-table.bin \
+             build/ota_data_initial.bin build/Rotator.bin build/littlefs.bin \
+             esp-web-tools-manifest.json \
+             pages/firmware/
+
+      - name: Configure Pages
+        if: steps.meta.outputs.channel == 'stable'
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload the flashing page
+        if: steps.meta.outputs.channel == 'stable'
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: pages
 
       - name: Summary
         run: |
@@ -119,3 +162,22 @@ jobs:
             cat manifest.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Separate job so it gets its own `github-pages` deployment environment and
+  # its own, narrower token - the build job needs `contents: write` for the
+  # releases, this one only ever needs to publish the artifact the build job
+  # staged.
+  deploy-pages:
+    needs: build
+    if: needs.build.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
