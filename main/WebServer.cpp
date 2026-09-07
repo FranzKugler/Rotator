@@ -362,6 +362,65 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * POST /api/debug/jog - {"microsteps": <signed int, default 0>, "samples": <int, default 1>}
+ *
+ * For offline calibration/filter development against an external script
+ * (e.g. Python) instead of a firmware rebuild+flash+wait cycle per
+ * iteration: jogs the motor by a raw, signed microstep count - bypassing
+ * every degree/offset conversion the normal Alpaca motion API applies - and
+ * returns a sensor/position snapshot. "samples" controls the AS5600 read
+ * averaging depth: 1 (default) is a fast single sample, higher trades speed
+ * for precision via the same averaging calibration uses.
+ *
+ * Expert-gated like the rest of this file's raw hardware access: unlike the
+ * Alpaca API, there is no sanity checking here beyond a generous jog-distance
+ * clamp, so this is meant for a developer driving it deliberately, not for
+ * routine use.
+ */
+static esp_err_t debug_jog_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *msItem = cJSON_GetObjectItem(root, "microsteps");
+    cJSON *samplesItem = cJSON_GetObjectItem(root, "samples");
+    double microstepsRaw = cJSON_IsNumber(msItem) ? msItem->valuedouble : 0;
+    int samples = cJSON_IsNumber(samplesItem) ? (int)samplesItem->valuedouble : 1;
+    cJSON_Delete(root);
+
+    // About two full motor revolutions (400 fullsteps x 256 microsteps each,
+    // per RotatorHW.cpp's FULLSTEPS_PER_ROTATION/MICROSTEPS - not visible
+    // here, they are file-local to RotatorHW.cpp) - generous for a single
+    // calibration step, but bounded so a mistaken huge value can't block
+    // this HTTP server task for long or spin the motor unexpectedly far.
+    constexpr double JOG_LIMIT = 2.0 * 400 * 256;
+    if (microstepsRaw < -JOG_LIMIT || microstepsRaw > JOG_LIMIT)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "microsteps out of range");
+        return ESP_FAIL;
+    }
+
+    auto &rotator = RotatorHW::getInstance();
+    rotator.jogMicrosteps((int32_t)microstepsRaw);
+    double raw = rotator.measureRawAngle(samples);
+    auto snapshot = rotator.getSensorSnapshot();
+
+    char buf[160];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"rawSensor\":%.3f,\"correctedSensor\":%.3f,\"stepPosition\":%ld,\"hall\":%s}",
+        raw, rotator.correctSensorReading(raw), (long)snapshot.stepPosition,
+        snapshot.hall ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
 // WiFi Server
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
@@ -579,6 +638,12 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = restart_handler};
     httpd_register_uri_handler(server, &restart);
+
+    httpd_uri_t debug_jog = {
+        .uri = "/api/debug/jog",
+        .method = HTTP_POST,
+        .handler = debug_jog_handler};
+    httpd_register_uri_handler(server, &debug_jog);
 
     // SSE endpoints
     httpd_uri_t zero_sse = {

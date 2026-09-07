@@ -719,6 +719,22 @@ RotatorHW::SensorSnapshot RotatorHW::getSensorSnapshot()
     };
 }
 
+void RotatorHW::jogMicrosteps(int32_t microsteps)
+{
+    if (microsteps == 0)
+        return;
+    _isMoving = true;
+    MOVE_WAIT(microsteps);
+    _isMoving = false;
+}
+
+double RotatorHW::measureRawAngle(int samples)
+{
+    if (samples <= 1)
+        return readAngleSafe();
+    return MEASURE_PRECISE_ANGLE_DOUBLE(samples);
+}
+
 void RotatorHW::putHalt()
 {
     // halt only if we're moving

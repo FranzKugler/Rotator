@@ -134,4 +134,19 @@ describe('Sensor calibration firmware contract', () => {
     expect(webServer).toContain('\\"hall\\"');
     expect(webServer).toContain('getSensorSnapshot()');
   });
+
+  it('gates the raw microstep jog debug endpoint behind expert mode and a distance clamp', () => {
+    // This endpoint bypasses every degree/offset conversion the normal
+    // Alpaca motion API applies, so it must stay behind the same expert gate
+    // as the rest of this file's raw hardware access, and must not accept an
+    // unbounded distance that could block the HTTP server task or spin the
+    // motor arbitrarily far on a typo.
+    expect(webServer).toContain('"/api/debug/jog"');
+    const fn = webServer.slice(webServer.indexOf('debug_jog_handler(httpd_req_t *req)'));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain('expert_lock_guard(req)');
+    expect(body).toMatch(/JOG_LIMIT/);
+    expect(body).toContain('jogMicrosteps(');
+    expect(body).toContain('measureRawAngle(samples)');
+  });
 });

@@ -34,6 +34,17 @@ public:
     };
     SensorSnapshot getSensorSnapshot();
 
+    // For offline calibration/filter development against an external script
+    // instead of a firmware rebuild+flash+wait cycle per iteration: jog the
+    // motor by a raw, signed microstep count (bypassing every degree/offset
+    // conversion the normal motion API applies) and read the sensor with a
+    // caller-chosen averaging depth (1 = the same fast single sample
+    // getSensorSnapshot() uses, higher = MEASURE_PRECISE_ANGLE_DOUBLE's
+    // averaging, for when precision matters more than speed).
+    void jogMicrosteps(int32_t microsteps);
+    double measureRawAngle(int samples = 1);
+    int32_t getStepPositionSafe();
+
     // Quality metrics from a calibrateAngleSensor() run, in degrees of
     // AS5600 error. "Before" is measured against the coefficients that were
     // in effect when the run started, "after" against the freshly fitted
@@ -103,8 +114,10 @@ private:
     // both, and a concurrent read caught mid-update can see an inconsistent
     // combination of the two. That is what turned a calibration run's
     // position rescale into a nonsense multi-million-step reading on the
-    // bench - not the rescale arithmetic itself.
-    int32_t getStepPositionSafe();
+    // bench - not the rescale arithmetic itself. getStepPositionSafe() is
+    // public (declared above) since it is a plain, harmless read; this
+    // setter stays private - it redefines the reference and is only safe in
+    // the few call sites that already reason carefully about the consequence.
     void setStepPositionSafe(int32_t newPosition);
 
     // sensor calibration
