@@ -100,6 +100,71 @@ def residual_stats(ideal_angles, measured, model):
     return rms * DEG_PER_COUNT, peak * DEG_PER_COUNT
 
 
+def motor_scale_from_sensor_sweep(sensor_sweep):
+    """The revolution-averaged counts/microstep scale, from the sensor-sweep's
+    own data (each point commanded exactly MICROSTEPS microsteps). This is a
+    global correction to the *ideal* 4096/(FULLSTEPS_PER_ROTATION*MICROSTEPS)
+    scale - a real stepper's mechanical step angle is rarely exactly nominal -
+    separate from the finer within-full-step wobble motor-sweep() measures.
+    """
+    measured = sensor_sweep["measured"]
+    n = len(measured)
+    # measured[i] is anchored within +/-2048 counts of ideal[i], which itself
+    # resets every FULLSTEPS_PER_ROTATION points - undo that wrap to get a
+    # monotonic unwrapped angle across the whole multi-revolution sweep.
+    unwrapped = [m + 4096.0 * (i // FULLSTEPS_PER_ROTATION) for i, m in enumerate(measured)]
+    xs = [i * MICROSTEPS for i in range(n)]
+    slope, _ = linear_fit(xs, unwrapped)
+    ideal_slope = 4096.0 / FULLSTEPS_PER_ROTATION / MICROSTEPS
+    print(f"  motor scale from sensor sweep: {slope:.6f} counts/microstep (ideal={ideal_slope:.6f}, "
+          f"{100 * (slope / ideal_slope - 1):+.3f}%)")
+    return slope
+
+
+class SensorMotorEKF:
+    """The simplest useful version of the EKF sketched (but left unfinished,
+    dead code) in RotatorHW.cpp's h_meas()/H_jacobian()/ekf_predict()/
+    ekf_update(): state x is the estimated absolute motor-shaft angle, in
+    AS5600 count units, unwrapped (not wrapped to 0..4096). Predict advances
+    it by a commanded microstep delta through the measured (not ideal) motor
+    scale; update pulls it toward the raw sensor reading through the fitted
+    eccentricity model, exactly like correctSensorReading() but expressed as
+    an EKF measurement function so its Jacobian can weight the correction by
+    how sensitive the sensor curve is at the current angle.
+    """
+
+    def __init__(self, x0, sensor_model, motor_scale, q, r):
+        self.x = x0
+        self.P = 1.0
+        self.model = sensor_model
+        self.motor_scale = motor_scale
+        self.Q = q
+        self.R = r
+
+    def predict(self, delta_microsteps):
+        self.x += self.motor_scale * delta_microsteps
+        self.P += self.Q
+
+    def _h_and_H(self):
+        C0, A, B = self.model
+        theta = 2.0 * math.pi * self.x / 4096.0
+        dtheta_dx = 2.0 * math.pi / 4096.0
+        err = C0
+        Hj = 1.0
+        for k in range(1, len(A)):
+            err += A[k] * math.cos(k * theta) + B[k] * math.sin(k * theta)
+            Hj += dtheta_dx * k * (-A[k] * math.sin(k * theta) + B[k] * math.cos(k * theta))
+        return self.x + err, Hj
+
+    def update(self, raw_measurement):
+        pred, Hj = self._h_and_H()
+        y = wrap4096(raw_measurement - pred)
+        S = Hj * self.P * Hj + self.R
+        K = self.P * Hj / S
+        self.x += K * y
+        self.P *= 1.0 - K * Hj
+
+
 def check_position_roundtrip(label, start_pos, end_pos):
     """Every sweep below returns the motor to its starting position, so
     stepPosition should exactly match before and after - a free, continuous
@@ -255,11 +320,102 @@ def cmd_backlash(host, distance=2000, samples=15, repeats=3, **_):
     return {"diffs_counts": diffs}
 
 
+def cmd_ekf_walk(host, sensor_model, motor_scale, n=120, max_step=400, ref_samples=40, op_samples=5,
+                  fault_at=60, fault_microsteps=60, seed=42, **_):
+    """Collect a random walk of small moves for offline EKF validation.
+
+    At each point records: the microstep delta actually commanded (ground
+    truth motion), a heavily-averaged "reference" reading (the best proxy for
+    true position this rig has), and a lightly-averaged "operational" reading
+    (what a live tracker would realistically read on every step). Partway
+    through, one step's *reported* delta is deliberately wrong by
+    `fault_microsteps` while the real motion (and therefore the sensor
+    readings) reflect what actually happened - simulating a missed/miscounted
+    step without needing to actually cause one. This is later replayed
+    offline through three estimators with no further hardware access needed.
+    """
+    import random
+
+    rng = random.Random(seed)
+    print(f"[ekf-walk] {n} random steps, fault of {fault_microsteps} microsteps injected at step {fault_at}")
+    start_pos = jog(host, 0, 1)["stepPosition"]
+    records = []
+    for i in range(n):
+        true_delta = rng.randint(20, max_step) * rng.choice([1, -1])
+        jog(host, true_delta, 1)
+        ref = jog(host, 0, ref_samples)["rawSensor"]
+        op = jog(host, 0, op_samples)["rawSensor"]
+        reported_delta = true_delta - fault_microsteps if i == fault_at else true_delta
+        records.append({"true_delta": true_delta, "reported_delta": reported_delta, "ref": ref, "op": op})
+        if i % 20 == 0:
+            print(f"  step {i:3d}/{n}")
+    total_true = sum(r["true_delta"] for r in records)
+    end_pos = jog(host, -total_true, 1)["stepPosition"]
+    check_position_roundtrip("ekf-walk", start_pos, end_pos)
+    return {"records": records, "sensor_model": sensor_model, "motor_scale": motor_scale}
+
+
+def analyze_ekf_walk(walk):
+    """Offline replay: naive open-loop step counting vs sensor-only vs the
+    fused EKF, all judged against the heavily-averaged reference reading
+    (corrected through the same sensor model) at each step. No further
+    hardware access - this is the point of collecting `records` up front.
+    """
+    records = walk["records"]
+    model = tuple(walk["sensor_model"]) if not isinstance(walk["sensor_model"], tuple) else walk["sensor_model"]
+    C0, A, B = model
+    model = (C0, A, B)
+    ideal_scale = 4096.0 / FULLSTEPS_PER_ROTATION / MICROSTEPS
+    motor_scale = walk["motor_scale"]
+
+    # records[0]'s ref/op readings were already taken *after* records[0]'s
+    # move (see cmd_ekf_walk: jog() happens before the readings), so
+    # initializing state from records[0]["op"] already reflects that first
+    # move - applying records[0]["reported_delta"] again in the loop would
+    # double-count it. Each subsequent record's delta is the move that
+    # happened *between* the previous reading and this one, so it is applied
+    # before comparing against that record's truth.
+    x0 = correct(records[0]["op"], model)
+    naive_x = x0
+    ekf = SensorMotorEKF(x0, model, motor_scale, q=0.3 ** 2, r=(0.4714 ** 2) / 5)  # R for op_samples=5, from the noise probe
+
+    rows = [{
+        "naive_err_deg": 0.0,
+        "sensor_only_err_deg": 0.0,
+        "ekf_err_deg": 0.0,
+    }]
+    for rec in records[1:]:
+        ref_truth = correct(rec["ref"], model)
+
+        naive_x += ideal_scale * rec["reported_delta"]
+        sensor_only = correct(rec["op"], model)
+        ekf.predict(rec["reported_delta"])
+        ekf.update(rec["op"])
+
+        rows.append({
+            "naive_err_deg": wrap4096(naive_x - ref_truth) * DEG_PER_COUNT,
+            "sensor_only_err_deg": wrap4096(sensor_only - ref_truth) * DEG_PER_COUNT,
+            "ekf_err_deg": wrap4096(ekf.x - ref_truth) * DEG_PER_COUNT,
+        })
+
+    def rms(key, skip_before=0):
+        vals = [r[key] for r in rows[skip_before:]]
+        return math.sqrt(sum(v * v for v in vals) / len(vals))
+
+    print("[ekf-walk analysis]")
+    print(f"  RMS error, whole walk    : naive={rms('naive_err_deg'):.4f}  "
+          f"sensor-only={rms('sensor_only_err_deg'):.4f}  ekf={rms('ekf_err_deg'):.4f} (deg)")
+    print(f"  RMS error, after the fault: naive={rms('naive_err_deg', 60):.4f}  "
+          f"sensor-only={rms('sensor_only_err_deg', 60):.4f}  ekf={rms('ekf_err_deg', 60):.4f} (deg)")
+    return rows
+
+
 COMMANDS = {
     "noise": cmd_noise,
     "sensor-sweep": cmd_sensor_sweep,
     "motor-sweep": cmd_motor_sweep,
     "backlash": cmd_backlash,
+    "ekf-walk": cmd_ekf_walk,
 }
 
 
@@ -273,6 +429,13 @@ def main():
     parser.add_argument("--step-span", type=int, default=4, help="motor-sweep: microsteps between sample points")
     parser.add_argument("--distance", type=int, default=2000, help="backlash: approach distance in microsteps")
     parser.add_argument("--repeats", type=int, default=3, help="backlash: number of approach pairs")
+    parser.add_argument("--walk-n", type=int, default=120, help="ekf-walk: number of random steps")
+    parser.add_argument("--fault-at", type=int, default=60, help="ekf-walk: step index to misreport")
+    parser.add_argument("--fault-microsteps", type=int, default=60, help="ekf-walk: size of the injected miscount")
+    parser.add_argument("--ref-samples", type=int, default=40, help="ekf-walk: averaging depth for the 'truth' reading")
+    parser.add_argument("--op-samples", type=int, default=5, help="ekf-walk: averaging depth for the per-step reading")
+    parser.add_argument("--seed", type=int, default=42, help="ekf-walk: RNG seed, for reproducible walks")
+    parser.add_argument("--load", help="reuse a prior --out JSON's sensor_sweep instead of re-sweeping")
     parser.add_argument("--out", help="write all results as JSON to this path")
     args = parser.parse_args()
 
@@ -284,21 +447,38 @@ def main():
         sys.exit(f"could not reach {args.host}: {e.reason}")
 
     out = {}
+    if args.load:
+        with open(args.load) as f:
+            loaded = json.load(f)
+        if "sensor_sweep" in loaded:
+            out["sensor_sweep"] = loaded["sensor_sweep"]
+            print(f"[load] reusing sensor_sweep from {args.load} (C0={out['sensor_sweep']['C0']:.3f})")
+
     if args.command in ("noise", "all"):
         out["noise"] = cmd_noise(args.host, n=30)
-    if args.command in ("sensor-sweep", "all"):
-        sensor = cmd_sensor_sweep(args.host, revolutions=args.revolutions, samples=args.samples)
-        out["sensor_sweep"] = sensor
-    if args.command in ("motor-sweep", "all"):
+    if args.command in ("sensor-sweep", "all") and "sensor_sweep" not in out:
+        out["sensor_sweep"] = cmd_sensor_sweep(args.host, revolutions=args.revolutions, samples=args.samples)
+    if args.command in ("motor-sweep", "all", "ekf-walk"):
         if "sensor_sweep" not in out:
-            print("[motor-sweep] no sensor model from this run - sweeping one revolution first")
+            print("[info] no sensor model available - sweeping one revolution first")
             out["sensor_sweep"] = cmd_sensor_sweep(args.host, revolutions=1, samples=args.samples)
+    if args.command in ("motor-sweep", "all"):
         model = (out["sensor_sweep"]["C0"], out["sensor_sweep"]["A"], out["sensor_sweep"]["B"])
         out["motor_sweep"] = cmd_motor_sweep(
             args.host, model, groups=args.groups, step_span=args.step_span, samples=args.samples
         )
     if args.command in ("backlash", "all"):
         out["backlash"] = cmd_backlash(args.host, distance=args.distance, samples=args.samples, repeats=args.repeats)
+    if args.command in ("ekf-walk", "all"):
+        model = (out["sensor_sweep"]["C0"], out["sensor_sweep"]["A"], out["sensor_sweep"]["B"])
+        scale = motor_scale_from_sensor_sweep(out["sensor_sweep"])
+        walk = cmd_ekf_walk(
+            args.host, model, scale, n=args.walk_n, fault_at=args.fault_at,
+            fault_microsteps=args.fault_microsteps, ref_samples=args.ref_samples,
+            op_samples=args.op_samples, seed=args.seed,
+        )
+        walk["rows"] = analyze_ekf_walk(walk)
+        out["ekf_walk"] = walk
 
     if args.out:
         with open(args.out, "w") as f:
