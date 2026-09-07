@@ -186,6 +186,31 @@ describe('Sensor calibration firmware contract', () => {
   });
 });
 
+describe('TMC2209 current configuration firmware contract', () => {
+  it('does not let setRunCurrent()/enableCoolStep() override the RMS current setup', () => {
+    // Regression test: begin() used to call setRMSCurrent(250, 0.11, 0.2) and
+    // then immediately setRunCurrent(100), which discards the CS that
+    // setRMSCurrent() had just computed and instead drives IRUN to the
+    // driver's absolute maximum (CS=31, ~980mA at this Rsense/vsense) while
+    // IHOLD stays at the small setRMSCurrent()-derived value. At this
+    // motor's 5V supply the coil (17ohm/phase) can physically draw at most
+    // ~290mA, so StealthChop's current regulator saturated its PWM duty
+    // cycle for most of each microstep's sine/cosine wave - only regulating
+    // correctly within roughly +-17 degrees of each zero crossing - a likely
+    // major contributor to the measured motor-wobble. enableCoolStep()
+    // compounds this by pulling current below IRUN whenever it estimates low
+    // load, fighting positional stiffness. Precision, not quietness or power
+    // draw, is what this application needs.
+    const start = rotatorHW.indexOf('void RotatorHW::begin()');
+    const end = rotatorHW.indexOf('\nvoid RotatorHW::', start + 1);
+    const body = rotatorHW.slice(start, end);
+    expect(body).toContain('setRMSCurrent(');
+    expect(body).not.toContain('setRunCurrent(');
+    expect(body).not.toContain('enableCoolStep()');
+    expect(body).toContain('disableCoolStep()');
+  });
+});
+
 describe('HTTP server handler-table headroom', () => {
   it('registers real boot-time URI handlers with real headroom below max_uri_handlers', () => {
     // Regression test: a live device panicked with ESP_ERR_HTTPD_HANDLERS_FULL

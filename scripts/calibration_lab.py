@@ -52,6 +52,22 @@ def jog(host, microsteps=0, samples=1, timeout=10):
         return json.loads(resp.read())
 
 
+def align_fullstep(host, timeout=15):
+    """POST /api/debug/align-fullstep - see RotatorHW::alignToFullStep(). A
+    stepper only has FULLSTEPS_PER_ROTATION true mechanical equilibrium
+    positions, not FULLSTEPS_PER_ROTATION*MICROSTEPS - "stepPosition 137" on
+    its own is only ever a position *within* whichever full step the motor
+    happened to be inside. This briefly switches the driver to full-step
+    mode, takes one real full step, switches back, and returns the resulting
+    stepPosition as a "phase 0" reference the caller can trust, instead of
+    assuming whatever stepPosition already happened to be was full-step-
+    aligned - see cmd_motor_sweep(), which needs exactly that assumption.
+    """
+    req = Request(f"http://{host}/api/debug/align-fullstep", data=b"", method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
 # ------------------------------------------------------------------- maths
 # Deliberately mirrors RotatorHW.cpp's calibrateAngleSensorStep()/
 # calibrateAngleSensorFinalize()/correctSensorReading()/computeResidual() so
@@ -307,7 +323,7 @@ def cmd_sensor_sweep(host, revolutions=1, samples=8, kmax=KMAX, **_):
     return {"ideal": ideal_angles, "measured": measured, "C0": C0, "A": A, "B": B}
 
 
-def cmd_motor_sweep(host, sensor_model, groups=4, step_span=4, samples=15, **_):
+def cmd_motor_sweep(host, sensor_model, groups=4, step_span=4, samples=15, run_in_microsteps=256, **_):
     """Fine microstep sweep across one full step, repeated at `groups` different
     absolute positions, to see whether the stepper's own within-step
     nonlinearity is a fixed, position-independent characteristic (evidence it
@@ -318,10 +334,40 @@ def cmd_motor_sweep(host, sensor_model, groups=4, step_span=4, samples=15, **_):
     model = (C0, A, B)
     n_points = MICROSTEPS // step_span
     print(f"[motor-sweep] {groups} groups x {n_points} points ({step_span} microsteps/point, samples={samples})")
-    start_pos = jog(host, 0, 1)["stepPosition"]
+
+    # Establish a true mechanical full-step reference *before* measuring -
+    # without this, "start here" is only ever an assumption, not a fact, and
+    # the group-offset bug below would have gone undetected without first
+    # asking whether motor-sweep measurements even started from a genuine
+    # full-step reference in the first place.
+    start_pos = align_fullstep(host)["stepPosition"]
+    print(f"  aligned to true full-step position {start_pos}")
+
+    if run_in_microsteps:
+        # align_fullstep() just switched the TMC2209 out of full-step mode -
+        # without this, group 0 would be the *only* group ever measured
+        # immediately after that switch, while every later group already has
+        # hundreds of ordinary 256-microstep moves behind it by the time it's
+        # reached. A live A/B test (near vs. 180 degrees from the Hall
+        # magnet) found group 0 anomalous in both positions, though less so
+        # far from the magnet - this run-in (net zero motion) isolates how
+        # much of that is a driver-settling artifact of the mode switch
+        # itself versus genuine magnet proximity.
+        jog(host, run_in_microsteps, 1)
+        jog(host, -run_in_microsteps, 1)
+        print(f"  ran in {run_in_microsteps} microsteps forward/back before measuring group 0")
+
     results = {}
     for g in range(groups):
-        offset = g * (FULLSTEPS_PER_ROTATION * MICROSTEPS // groups)
+        # A whole number of FULL STEPS apart, not a raw division of
+        # FULLSTEPS_PER_ROTATION*MICROSTEPS by `groups` - the latter isn't
+        # always a multiple of MICROSTEPS (e.g. groups=6:
+        # 400*256//6=17066, 17066/256=66.664...), which silently
+        # phase-misaligns each group's "microstep 0" against the full-step
+        # reference above and against every other group. Confirmed real bug
+        # in an earlier run.
+        fullstep_offset = g * (FULLSTEPS_PER_ROTATION // groups)
+        offset = fullstep_offset * MICROSTEPS
         jog(host, offset, 1)
         angles = []
         for _ in range(n_points):
@@ -516,6 +562,10 @@ def main():
     parser.add_argument("--samples", type=int, default=8, help="AS5600 averaging depth per measurement")
     parser.add_argument("--groups", type=int, default=4, help="motor-sweep: positions around the revolution to sample")
     parser.add_argument("--step-span", type=int, default=4, help="motor-sweep: microsteps between sample points")
+    parser.add_argument("--run-in", type=int, default=256, dest="run_in_microsteps",
+                         help="motor-sweep: microsteps to move forward/back after align_fullstep(), "
+                              "before measuring group 0, to separate driver-settling from position effects "
+                              "(0 to disable)")
     parser.add_argument("--distance", type=int, default=2000, help="backlash: approach distance in microsteps")
     parser.add_argument("--repeats", type=int, default=3, help="backlash: number of approach pairs")
     parser.add_argument("--walk-n", type=int, default=120, help="ekf-walk: number of random steps")
@@ -564,7 +614,8 @@ def main():
     if args.command in ("motor-sweep", "all") and "motor_sweep" not in out:
         model = (out["sensor_sweep"]["C0"], out["sensor_sweep"]["A"], out["sensor_sweep"]["B"])
         out["motor_sweep"] = cmd_motor_sweep(
-            args.host, model, groups=args.groups, step_span=args.step_span, samples=args.samples
+            args.host, model, groups=args.groups, step_span=args.step_span, samples=args.samples,
+            run_in_microsteps=args.run_in_microsteps,
         )
     if args.command in ("backlash", "all"):
         out["backlash"] = cmd_backlash(args.host, distance=args.distance, samples=args.samples, repeats=args.repeats)

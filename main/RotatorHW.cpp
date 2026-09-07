@@ -77,10 +77,6 @@ const uint32_t NORMAL_MOTOR_SPEED = STEPS_PER_ROTATION / 10;
 const double SCALE_S = 4096.0f / (2.0f * M_PI);
 // const long unsigned int EDGE_STEPS = 256 * 256;
 
-// current values may need to be reduced to prevent overheating depending on
-// specific motor and power supply voltage
-const unsigned char RUN_CURRENT_PERCENT = 100;
-
 RotatorHW &RotatorHW::getInstance()
 {
     static RotatorHW instance;
@@ -124,13 +120,33 @@ RotatorHW::RotatorHW()
 void RotatorHW::begin()
 {
     ESP_LOGI(TAG, "Intializing Rotator HW");
-    // Setup the TMC2209 driver, 250mA, Cool Step with Enable pin
+    // Setup the TMC2209 driver, 280mA RMS with Enable pin.
+    //
+    // Two calls used to run right after this: one that forced the run
+    // current to the driver's absolute maximum (CS=31, ~980mA at this
+    // Rsense/vsense) - discarding the CS that setRMSCurrent() had just
+    // computed, while the hold current stayed at the small
+    // setRMSCurrent()-derived value, a ~16:1 run:hold mismatch - and one that
+    // enabled CoolStep. At this motor's 5V supply, 980mA is also far beyond
+    // what the coil (17ohm/phase) can physically draw (~290mA ceiling), so
+    // StealthChop's current regulator saturated its PWM duty cycle for most
+    // of each microstep's sine/cosine wave, only regulating correctly near
+    // the zero crossings. Removing the override alone (250mA target, CS=7)
+    // measurably worsened wobble right after alignToFullStep() on the real
+    // rotator: the old, distorted waveform apparently delivered more average
+    // torque against cogging/friction than a clean-but-weak 245mA sine peak
+    // does. 280mA (CS=8, ~276mA actual peak) stays safely under the ~290mA
+    // physical ceiling - so the regulator still never saturates - while
+    // recovering some of that torque headroom; this needs the same live
+    // verification before it can be trusted. CoolStep still only pulls
+    // current below the run setting whenever it estimates low load, fighting
+    // positional stiffness - precision, not quietness or power draw, is what
+    // this application needs, so it stays off.
     stepper_driver.setup(serial_stream, 250000, TMC2209::SERIAL_ADDRESS_0, RX_PIN, TX_PIN);
     stepper_driver.setHardwareEnablePin(ENABLE_PIN);
-    stepper_driver.setRMSCurrent(250, 0.11, 0.2);
+    stepper_driver.setRMSCurrent(280, 0.11, 0.6);
     stepper_driver.enableAutomaticCurrentScaling();
-    stepper_driver.setRunCurrent(RUN_CURRENT_PERCENT);
-    stepper_driver.enableCoolStep();
+    stepper_driver.disableCoolStep();
     stepper_driver.enable();
 
     // Setup the AS5600 driver
