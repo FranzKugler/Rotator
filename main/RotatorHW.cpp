@@ -728,6 +728,22 @@ void RotatorHW::jogMicrosteps(int32_t microsteps)
     _isMoving = false;
 }
 
+int32_t RotatorHW::alignToFullStep()
+{
+    // forwardStep()+delay() - the same choice calibrateAngleSensor() makes
+    // for the identical microstep-mode switch, and for the same reason: a
+    // queued move()+isRunning() poll measurably degraded results there when
+    // tried, and this is the same driver-microstepping change applied to
+    // the same live motor.
+    _isMoving = true;
+    stepper_driver.setMicrostepsPerStep(1);
+    stepper->forwardStep();
+    delay(20);
+    stepper_driver.setMicrostepsPerStep(256);
+    _isMoving = false;
+    return getStepPositionSafe();
+}
+
 double RotatorHW::measureRawAngle(int samples)
 {
     if (samples <= 1)

@@ -421,6 +421,29 @@ static esp_err_t debug_jog_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * POST /api/debug/align-fullstep
+ *
+ * A stepper only has FULLSTEPS_PER_ROTATION true mechanical equilibrium
+ * positions - any within-full-step analysis over /api/debug/jog's raw
+ * microsteps needs a stepPosition value known to actually sit on one of
+ * them, not just assumed to. This drives the motor to a real full-step
+ * position (main/RotatorHW.cpp's RotatorHW::alignToFullStep()) and returns
+ * it as that reference. Expert-gated like the rest of this file's raw
+ * hardware access.
+ */
+static esp_err_t debug_align_fullstep_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    int32_t pos = RotatorHW::getInstance().alignToFullStep();
+    char buf[48];
+    int len = snprintf(buf, sizeof(buf), "{\"stepPosition\":%ld}", (long)pos);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
 // WiFi Server
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
@@ -644,6 +667,12 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = debug_jog_handler};
     httpd_register_uri_handler(server, &debug_jog);
+
+    httpd_uri_t debug_align = {
+        .uri = "/api/debug/align-fullstep",
+        .method = HTTP_POST,
+        .handler = debug_align_fullstep_handler};
+    httpd_register_uri_handler(server, &debug_align);
 
     // SSE endpoints
     httpd_uri_t zero_sse = {

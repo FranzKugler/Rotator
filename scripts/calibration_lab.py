@@ -121,6 +121,54 @@ def motor_scale_from_sensor_sweep(sensor_sweep):
     return slope
 
 
+def fit_motor_wobble(motor_sweep_groups, step_span=2, exclude=("0",), kmax=3):
+    """Fourier model (period MICROSTEPS) of the within-full-step motor/driver
+    wobble motor-sweep() measures, pooled across groups (default: all but
+    group 0, the Hall-magnet-adjacent outlier - see the published lab
+    report). Each group's own angles are detrended (its own best-fit line
+    removed) before pooling, exactly like the per-group wobble analysis in
+    cmd_motor_sweep(), so this is independent of any group's absolute
+    position or slope estimate.
+    """
+    phases, wobbles = [], []
+    for g, data in motor_sweep_groups.items():
+        if g in exclude:
+            continue
+        angles = data["angles"] if isinstance(data, dict) else data
+        n = len(angles)
+        slope, intercept = linear_fit(range(n), angles)
+        for i, a in enumerate(angles):
+            phases.append((i * step_span) % MICROSTEPS)
+            wobbles.append(a - (slope * i + intercept))
+
+    n = len(phases)
+    sum0 = sum(wobbles)
+    sumC = [0.0] * (kmax + 1)
+    sumS = [0.0] * (kmax + 1)
+    for phase, w in zip(phases, wobbles):
+        theta = 2.0 * math.pi * phase / MICROSTEPS
+        for k in range(1, kmax + 1):
+            sumC[k] += w * math.cos(k * theta)
+            sumS[k] += w * math.sin(k * theta)
+    C0 = sum0 / n
+    A = [0.0] + [2.0 * sumC[k] / n for k in range(1, kmax + 1)]
+    B = [0.0] + [2.0 * sumS[k] / n for k in range(1, kmax + 1)]
+    print(f"  motor wobble model (pooled {len(motor_sweep_groups) - len(exclude)} groups, {n} points): "
+          f"C0={C0:.4f}  " + "  ".join(f"A{k}={A[k]:.4f}/B{k}={B[k]:.4f}" for k in range(1, kmax + 1)))
+    return (C0, A, B)
+
+
+def motor_wobble(phase_microsteps, model):
+    """Evaluate the fitted within-full-step wobble at a given (known, commanded)
+    phase - counts of angle deviation from the ideal linear microstep ramp."""
+    C0, A, B = model
+    theta = 2.0 * math.pi * phase_microsteps / MICROSTEPS
+    val = C0
+    for k in range(1, len(A)):
+        val += A[k] * math.cos(k * theta) + B[k] * math.sin(k * theta)
+    return val
+
+
 class SensorMotorEKF:
     """The simplest useful version of the EKF sketched (but left unfinished,
     dead code) in RotatorHW.cpp's h_meas()/H_jacobian()/ekf_predict()/
@@ -131,18 +179,37 @@ class SensorMotorEKF:
     eccentricity model, exactly like correctSensorReading() but expressed as
     an EKF measurement function so its Jacobian can weight the correction by
     how sensitive the sensor curve is at the current angle.
+
+    The optional `motor_wobble_model` is a second Fourier model (period
+    MICROSTEPS, see fit_motor_wobble()) for the within-full-step motor/driver
+    nonlinearity found by motor-sweep. Unlike the sensor model, this one is
+    evaluated at the *commanded* microstep count - a known, exact quantity,
+    not the uncertain state - so applying it needs no Jacobian/linearization
+    at all: it is just a better deterministic prediction, folded straight
+    into the process model. Tracking `u` (cumulative commanded microsteps)
+    separately from `x` (the fused, uncertain estimate) is what makes that
+    possible.
     """
 
-    def __init__(self, x0, sensor_model, motor_scale, q, r):
+    def __init__(self, x0, sensor_model, motor_scale, q, r, motor_wobble_model=None, u0=0):
         self.x = x0
         self.P = 1.0
         self.model = sensor_model
         self.motor_scale = motor_scale
         self.Q = q
         self.R = r
+        self.motor_wobble_model = motor_wobble_model
+        self.u = u0
 
     def predict(self, delta_microsteps):
-        self.x += self.motor_scale * delta_microsteps
+        if self.motor_wobble_model is not None:
+            u_new = self.u + delta_microsteps
+            g_old = motor_wobble(self.u % MICROSTEPS, self.motor_wobble_model)
+            g_new = motor_wobble(u_new % MICROSTEPS, self.motor_wobble_model)
+            self.x += self.motor_scale * delta_microsteps + (g_new - g_old)
+            self.u = u_new
+        else:
+            self.x += self.motor_scale * delta_microsteps
         self.P += self.Q
 
     def _h_and_H(self):
@@ -352,14 +419,16 @@ def cmd_ekf_walk(host, sensor_model, motor_scale, n=120, max_step=400, ref_sampl
     total_true = sum(r["true_delta"] for r in records)
     end_pos = jog(host, -total_true, 1)["stepPosition"]
     check_position_roundtrip("ekf-walk", start_pos, end_pos)
-    return {"records": records, "sensor_model": sensor_model, "motor_scale": motor_scale}
+    return {"records": records, "sensor_model": sensor_model, "motor_scale": motor_scale, "start_pos": start_pos}
 
 
-def analyze_ekf_walk(walk):
+def analyze_ekf_walk(walk, motor_wobble_model=None):
     """Offline replay: naive open-loop step counting vs sensor-only vs the
-    fused EKF, all judged against the heavily-averaged reference reading
-    (corrected through the same sensor model) at each step. No further
-    hardware access - this is the point of collecting `records` up front.
+    fused EKF (with and without the within-full-step motor wobble model, if
+    one is supplied), all judged against the heavily-averaged reference
+    reading (corrected through the same sensor model) at each step. No
+    further hardware access - this is the point of collecting `records` up
+    front.
     """
     records = walk["records"]
     model = tuple(walk["sensor_model"]) if not isinstance(walk["sensor_model"], tuple) else walk["sensor_model"]
@@ -377,12 +446,22 @@ def analyze_ekf_walk(walk):
     # before comparing against that record's truth.
     x0 = correct(records[0]["op"], model)
     naive_x = x0
-    ekf = SensorMotorEKF(x0, model, motor_scale, q=0.3 ** 2, r=(0.4714 ** 2) / 5)  # R for op_samples=5, from the noise probe
+    r_op = (0.4714 ** 2) / 5  # R for op_samples=5, from the noise probe
+    ekf = SensorMotorEKF(x0, model, motor_scale, q=0.3 ** 2, r=r_op)
+    ekf_wobble = None
+    if motor_wobble_model is not None:
+        # u tracks *reported* (not true) cumulative microsteps - the wobble
+        # model, like everything else here, only ever sees what the tracker
+        # was told, exactly mirroring a real onboard estimator.
+        u0 = walk["start_pos"] + records[0]["reported_delta"]
+        ekf_wobble = SensorMotorEKF(x0, model, motor_scale, q=0.15 ** 2, r=r_op,
+                                     motor_wobble_model=motor_wobble_model, u0=u0)
 
     rows = [{
         "naive_err_deg": 0.0,
         "sensor_only_err_deg": 0.0,
         "ekf_err_deg": 0.0,
+        "ekf_wobble_err_deg": 0.0,
     }]
     for rec in records[1:]:
         ref_truth = correct(rec["ref"], model)
@@ -390,23 +469,33 @@ def analyze_ekf_walk(walk):
         naive_x += ideal_scale * rec["reported_delta"]
         sensor_only = correct(rec["op"], model)
         ekf.predict(rec["reported_delta"])
+        if ekf_wobble is not None:
+            ekf_wobble.predict(rec["reported_delta"])
+            ekf_wobble.update(rec["op"])
         ekf.update(rec["op"])
 
-        rows.append({
+        row = {
             "naive_err_deg": wrap4096(naive_x - ref_truth) * DEG_PER_COUNT,
             "sensor_only_err_deg": wrap4096(sensor_only - ref_truth) * DEG_PER_COUNT,
             "ekf_err_deg": wrap4096(ekf.x - ref_truth) * DEG_PER_COUNT,
-        })
+        }
+        if ekf_wobble is not None:
+            row["ekf_wobble_err_deg"] = wrap4096(ekf_wobble.x - ref_truth) * DEG_PER_COUNT
+        rows.append(row)
 
     def rms(key, skip_before=0):
-        vals = [r[key] for r in rows[skip_before:]]
-        return math.sqrt(sum(v * v for v in vals) / len(vals))
+        vals = [r[key] for r in rows[skip_before:] if key in r]
+        return math.sqrt(sum(v * v for v in vals) / len(vals)) if vals else float("nan")
 
+    fault_at = None
+    for i, rec in enumerate(records):
+        if rec["reported_delta"] != rec["true_delta"]:
+            fault_at = i
+    keys = ["naive_err_deg", "sensor_only_err_deg", "ekf_err_deg"] + (["ekf_wobble_err_deg"] if ekf_wobble else [])
     print("[ekf-walk analysis]")
-    print(f"  RMS error, whole walk    : naive={rms('naive_err_deg'):.4f}  "
-          f"sensor-only={rms('sensor_only_err_deg'):.4f}  ekf={rms('ekf_err_deg'):.4f} (deg)")
-    print(f"  RMS error, after the fault: naive={rms('naive_err_deg', 60):.4f}  "
-          f"sensor-only={rms('sensor_only_err_deg', 60):.4f}  ekf={rms('ekf_err_deg', 60):.4f} (deg)")
+    print("  RMS error, whole walk     : " + "  ".join(f"{k.replace('_err_deg', '')}={rms(k):.4f}" for k in keys) + " (deg)")
+    if fault_at is not None:
+        print(f"  RMS error, after the fault: " + "  ".join(f"{k.replace('_err_deg', '')}={rms(k, fault_at):.4f}" for k in keys) + " (deg)")
     return rows
 
 
@@ -436,6 +525,7 @@ def main():
     parser.add_argument("--op-samples", type=int, default=5, help="ekf-walk: averaging depth for the per-step reading")
     parser.add_argument("--seed", type=int, default=42, help="ekf-walk: RNG seed, for reproducible walks")
     parser.add_argument("--load", help="reuse a prior --out JSON's sensor_sweep instead of re-sweeping")
+    parser.add_argument("--load-motor", help="reuse a prior --out JSON's motor_sweep for the wobble model (ekf-walk)")
     parser.add_argument("--out", help="write all results as JSON to this path")
     args = parser.parse_args()
 
@@ -453,6 +543,15 @@ def main():
         if "sensor_sweep" in loaded:
             out["sensor_sweep"] = loaded["sensor_sweep"]
             print(f"[load] reusing sensor_sweep from {args.load} (C0={out['sensor_sweep']['C0']:.3f})")
+        if "motor_sweep" in loaded:
+            out["motor_sweep"] = loaded["motor_sweep"]
+            print(f"[load] reusing motor_sweep from {args.load}")
+    if args.load_motor:
+        with open(args.load_motor) as f:
+            loaded = json.load(f)
+        if "motor_sweep" in loaded:
+            out["motor_sweep"] = loaded["motor_sweep"]
+            print(f"[load] reusing motor_sweep from {args.load_motor}")
 
     if args.command in ("noise", "all"):
         out["noise"] = cmd_noise(args.host, n=30)
@@ -462,7 +561,7 @@ def main():
         if "sensor_sweep" not in out:
             print("[info] no sensor model available - sweeping one revolution first")
             out["sensor_sweep"] = cmd_sensor_sweep(args.host, revolutions=1, samples=args.samples)
-    if args.command in ("motor-sweep", "all"):
+    if args.command in ("motor-sweep", "all") and "motor_sweep" not in out:
         model = (out["sensor_sweep"]["C0"], out["sensor_sweep"]["A"], out["sensor_sweep"]["B"])
         out["motor_sweep"] = cmd_motor_sweep(
             args.host, model, groups=args.groups, step_span=args.step_span, samples=args.samples
@@ -472,12 +571,16 @@ def main():
     if args.command in ("ekf-walk", "all"):
         model = (out["sensor_sweep"]["C0"], out["sensor_sweep"]["A"], out["sensor_sweep"]["B"])
         scale = motor_scale_from_sensor_sweep(out["sensor_sweep"])
+        wobble_model = fit_motor_wobble(out["motor_sweep"], step_span=args.step_span) if "motor_sweep" in out else None
+        if wobble_model is None:
+            print("[ekf-walk] no motor_sweep available (pass --load-motor or run motor-sweep first) - "
+                  "skipping the wobble-aware estimator")
         walk = cmd_ekf_walk(
             args.host, model, scale, n=args.walk_n, fault_at=args.fault_at,
             fault_microsteps=args.fault_microsteps, ref_samples=args.ref_samples,
             op_samples=args.op_samples, seed=args.seed,
         )
-        walk["rows"] = analyze_ekf_walk(walk)
+        walk["rows"] = analyze_ekf_walk(walk, motor_wobble_model=wobble_model)
         out["ekf_walk"] = walk
 
     if args.out:

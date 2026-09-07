@@ -5,6 +5,12 @@ const webServer = readFileSync(new URL('../main/WebServer.cpp', import.meta.url)
 const wifiManager = readFileSync(new URL('../main/WifiManager.cpp', import.meta.url), 'utf8');
 const ota = readFileSync(new URL('../main/OTAUpdate.c', import.meta.url), 'utf8');
 const rotatorHW = readFileSync(new URL('../main/RotatorHW.cpp', import.meta.url), 'utf8');
+const mainCpp = readFileSync(new URL('../main/main.cpp', import.meta.url), 'utf8');
+const alpacaApi = readFileSync(new URL('../main/alpaca_server/api.cpp', import.meta.url), 'utf8');
+const expertLock = readFileSync(new URL('../main/ExpertLock.c', import.meta.url), 'utf8');
+const fileRoutes = readFileSync(new URL('../main/FileRoutes.c', import.meta.url), 'utf8');
+const nvsRoutes = readFileSync(new URL('../main/NvsRoutes.c', import.meta.url), 'utf8');
+const logBuffer = readFileSync(new URL('../main/LogBuffer.c', import.meta.url), 'utf8');
 
 describe('WLAN firmware contract', () => {
   it('provides current WLAN state and hostname endpoints', () => {
@@ -148,5 +154,108 @@ describe('Sensor calibration firmware contract', () => {
     expect(body).toMatch(/JOG_LIMIT/);
     expect(body).toContain('jogMicrosteps(');
     expect(body).toContain('measureRawAngle(samples)');
+  });
+
+  it('gates the full-step alignment debug endpoint behind expert mode', () => {
+    // Regression test: a within-full-step analysis over /api/debug/jog's raw
+    // microsteps is only meaningful once "phase 0" is known to actually sit
+    // on a true mechanical full-step position, not just assumed to - two
+    // live sweeps found materially different (and unexplained) results
+    // before this existed. See RotatorHW::alignToFullStep().
+    expect(webServer).toContain('"/api/debug/align-fullstep"');
+    const fn = webServer.slice(webServer.indexOf('debug_align_fullstep_handler(httpd_req_t *req)'));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain('expert_lock_guard(req)');
+    expect(body).toContain('alignToFullStep()');
+  });
+
+  it('takes its one real full step with forwardStep(), not MOVE_WAIT', () => {
+    // Regression test, same lesson as calibrateAngleSensor() above applied
+    // to the same microstep-mode switch: MOVE_WAIT's stepper->move() +
+    // isRunning() poll measurably degraded results when tried for a
+    // full-step-mode move on this motor, while forwardStep()+delay() is the
+    // proven-safe primitive for it. alignToFullStep() must take one real
+    // step (not zero - a zero-length "step" would just re-arm full-step mode
+    // without ever proving the driver reached a mechanical equilibrium).
+    const fn = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::alignToFullStep()'));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain('setMicrostepsPerStep(1)');
+    expect(body).toContain('forwardStep()');
+    expect(body).toContain('setMicrostepsPerStep(256)');
+    expect(body).not.toContain('MOVE_WAIT');
+  });
+});
+
+describe('HTTP server handler-table headroom', () => {
+  it('registers real boot-time URI handlers with real headroom below max_uri_handlers', () => {
+    // Regression test: a live device panicked with ESP_ERR_HTTPD_HANDLERS_FULL
+    // (abort() in register_web_handles(), registering the final/wildcard
+    // handler, WebServer.cpp:706) after one more debug route was added on top
+    // of a boot-time total that was already sitting almost exactly at the
+    // then-configured max_uri_handlers=64 - found by reproducing the crash on
+    // an unrelated bare board with a full serial console attached, since the
+    // real rotator's own console is UART0, physically unreachable over its
+    // single dual-use USB-C port. Fix was raising the limit (see main.cpp);
+    // this test recomputes the real total and checks for headroom, so the
+    // next added route fails a fast local test instead of an on-device
+    // ESP_ERROR_CHECK abort. The total deliberately does NOT come from a
+    // naive count of every REGISTER_DEVICE_ROUTE(...) in
+    // alpaca_server/api.cpp - most of those are for Alpaca device types
+    // (covercalibrator, dome, focuser, ...) whose registration functions
+    // exist in that file but are never called for this project's Rotator
+    // device, and counting them overstates the real total enormously.
+    const countOccurrences = (text, pattern) => (text.match(new RegExp(pattern, 'g')) || []).length;
+    const sliceFunctionBody = (text, functionSignature) => {
+      const start = text.indexOf(functionSignature);
+      expect(start, `function not found: ${functionSignature}`).toBeGreaterThan(-1);
+      const body = text.slice(start);
+      return body.slice(0, body.indexOf('\n}'));
+    };
+
+    const maxUriHandlersMatch = mainCpp.match(/http_cfg\.max_uri_handlers\s*=\s*(\d+);/);
+    expect(maxUriHandlersMatch).not.toBeNull();
+    const maxUriHandlers = Number(maxUriHandlersMatch[1]);
+
+    // WebServer.cpp and LogBuffer.c call httpd_register_uri_handler() directly,
+    // no local wrapper.
+    const webServerRoutes = countOccurrences(webServer, 'httpd_register_uri_handler\\(');
+    const logBufferRoutes = countOccurrences(logBuffer, 'httpd_register_uri_handler\\(');
+
+    // OTAUpdate.c, ExpertLock.c, FileRoutes.c and NvsRoutes.c each go through
+    // a local wrapper (register_uri()/add_route()) that itself calls
+    // httpd_register_uri_handler() exactly once - counting the wrapper's own
+    // textual occurrence, rather than how many times callers invoke it, is
+    // the undercounting mistake this bug's own investigation made first.
+    const otaRoutes = countOccurrences(ota, 'register_uri\\("');
+    const expertRoutes = countOccurrences(expertLock, 'add_route\\(server,');
+    const fileRoutesCount = countOccurrences(fileRoutes, 'add_route\\(server,');
+    const nvsRoutesCount = countOccurrences(nvsRoutes, 'add_route\\(server,');
+
+    // alpaca_server/api.cpp: only what a Rotator device actually reaches -
+    // Api::register_routes()'s own direct /management/ routes,
+    // Api::register_device_routes()'s common REGISTER_DEVICE_ROUTE(...)
+    // calls (shared by every Alpaca device type), and
+    // Api::register_rotator_routes(), the only case this project's device
+    // type ever makes register_device_routes()'s switch(device_type)
+    // dispatch to - NOT its covercalibrator/dome/focuser/etc. siblings,
+    // which exist in the same file for other device types but are never
+    // called here.
+    const managementBlock = sliceFunctionBody(alpacaApi, 'void Api::register_routes(httpd_handle_t server)');
+    const commonBlock = sliceFunctionBody(alpacaApi, 'void Api::register_device_routes(');
+    const rotatorBlock = sliceFunctionBody(alpacaApi, 'void Api::register_rotator_routes(');
+    const alpacaRoutes =
+      countOccurrences(managementBlock, 'ESP_ERROR_CHECK\\(httpd_register_uri_handler\\(') +
+      countOccurrences(commonBlock, 'REGISTER_DEVICE_ROUTE\\(') +
+      countOccurrences(rotatorBlock, 'REGISTER_DEVICE_ROUTE\\(');
+
+    const total = webServerRoutes + logBufferRoutes + otaRoutes + expertRoutes +
+      fileRoutesCount + nvsRoutesCount + alpacaRoutes;
+
+    // Sanity floor: this project has always registered well over 50 routes -
+    // a much smaller total would mean the counting logic above broke (e.g. a
+    // renamed wrapper function), silently making the headroom check below
+    // meaningless rather than failing loudly.
+    expect(total).toBeGreaterThan(50);
+    expect(total + 10).toBeLessThanOrEqual(maxUriHandlers);
   });
 });

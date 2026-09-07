@@ -138,7 +138,13 @@ extern "C" void app_main(void)
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
     http_cfg.server_port = ALPACA_SERVER_PORT;
     http_cfg.uri_match_fn = httpd_uri_match_wildcard;
-    http_cfg.max_uri_handlers = 64;
+    // The Alpaca common+Rotator routes, WebServer's own routes, OTA, expert
+    // lock, file/NVS browsing and the log endpoint together already fill
+    // this close to exactly 64 - a live device panicked with
+    // ESP_ERR_HTTPD_HANDLERS_FULL registering the very last (wildcard)
+    // handler after just one more debug route was added. Sized with real
+    // headroom, not just enough for today's count.
+    http_cfg.max_uri_handlers = 96;
     http_cfg.stack_size = 16384;
     httpd_handle_t server = nullptr;
     ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));

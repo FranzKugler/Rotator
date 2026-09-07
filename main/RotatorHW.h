@@ -45,6 +45,17 @@ public:
     double measureRawAngle(int samples = 1);
     int32_t getStepPositionSafe();
 
+    // A stepper motor only has FULLSTEPS_PER_ROTATION true mechanical
+    // equilibrium positions - "microstep 137" is meaningless on its own, it
+    // is only ever a position *within* a full step. This briefly switches
+    // the driver to full-step mode, takes exactly one real full step (a true
+    // mechanical equilibrium by construction, not an assumption), switches
+    // back to 256 microsteps/step, and returns the resulting stepPosition -
+    // an anchor a caller can use as "phase 0" for any within-full-step
+    // analysis instead of assuming whatever stepPosition already happened to
+    // be was full-step-aligned.
+    int32_t alignToFullStep();
+
     // Quality metrics from a calibrateAngleSensor() run, in degrees of
     // AS5600 error. "Before" is measured against the coefficients that were
     // in effect when the run started, "after" against the freshly fitted
