@@ -74,7 +74,6 @@ const short unsigned int STEPS_PER_SENSORCOUNT = (MICROSTEPS * FULLSTEPS_PER_ROT
 const long unsigned int STEPS_PER_ROTATION = FULLSTEPS_PER_ROTATION * 10 * MICROSTEPS;
 const double DEGREE_PER_STEP = 360.0 / FULLSTEPS_PER_ROTATION / 10 / MICROSTEPS;
 const uint32_t NORMAL_MOTOR_SPEED = STEPS_PER_ROTATION / 10;
-const double SCALE_S = 4096.0f / (2.0f * M_PI);
 // const long unsigned int EDGE_STEPS = 256 * 256;
 
 RotatorHW &RotatorHW::getInstance()
@@ -102,14 +101,20 @@ RotatorHW::RotatorHW()
     }
     C0 = cfg.getC0();
 
-    // EKF values - later from config file
-    Q = 2e-6f;
-    R = 1.0f;
-    x = 0;
-    P = 1.0f;
-
-    _zeroPosSensorValue = 571;
-    _zeroPosSensorOffset = 571.0;
+    // Re-measured 2026-09-08 after the config.json C0 update (16.998 -> 597.444,
+    // A/B zeroed) - this constant is a corrected-sensor-value target, so it has
+    // to move with C0 or gotoMechanicalZero()'s edge search hunts for a value
+    // that no longer occurs anywhere near the real Hall window (silently
+    // homing to whatever MOVETO_WAIT((0+0)/2) lands on instead). Found by
+    // binary-searching both edges of the Hall trigger region live via
+    // /api/debug/jog: rising (false->true) at corrected~3175.556, falling
+    // (true->false) at corrected~973.556. That is a good ~1894-count-wide
+    // triggered region (~166 motor-shaft degrees), not a narrow index pulse -
+    // this project has no independent way yet to confirm that width is
+    // correct/intended rather than a magnet/airgap issue, so this midpoint
+    // should be treated as the best available estimate, not a settled value.
+    _zeroPosSensorValue = 27;
+    _zeroPosSensorOffset = 27.0;
 
     sensorValueforMechanicalZero = 3747;
     positionOffsetToMechanicalPosition = 20.0;
@@ -178,49 +183,6 @@ void RotatorHW::begin()
     // calibrateAngleSensor();
 
     ESP_LOGI(TAG, "Finished intializing Rotator HW");
-
-    /*
-        for (;;)
-        {
-            // double angle = 360.0 * esp_random() / UINT32_MAX;
-            // putAbsolutePosition(angle);
-            // delay(1000);
-            int32_t absolutPosition = 4000.0 * 256.0 * (double)esp_random() / UINT32_MAX;
-            x = 2.0 * M_PI * absolutPosition / 4000.0 / 256;
-            P += Q;
-            // predict sensor angle
-            double s_pred = FMOD4096(_zeroPosSensorOffset + x * 10.0 * 4096.0 / 2.0 / M_PI);
-            double err = C0;
-            for (int k = 1; k <= KMAX; ++k)
-                err += A[k] * cos(k * 10 * x) + B[k] * sin(k * 10 * x);
-
-            double h = FMOD4096(s_pred + err);
-
-            // Jakobian
-            double H = 4096.0 / 2.0 / M_PI;
-            for (int k = 1; k <= KMAX; ++k)
-                H += -A[k] * sin(k * 10 * x) + B[k] * cos(k * 10 * x);
-
-            // ekf_predict(absolutPosition - stepper->getCurrentPosition());
-
-            MOVETO_WAIT(absolutPosition);
-
-            for (int i=0; i<128; i++)
-            {
-                double y = as5600.readAngle() - h;
-                //double y = MEASURE_PRECISE_ANGLE_DOUBLE(64) - h;
-                double S = H * P * H + R;
-
-                double K = P * H / S;
-                x = x + K * y;
-                P = (1.0 - K * H) * P;
-            }
-
-            //    double sensorValue = MEASURE_PRECISE_ANGLE_DOUBLE(64);
-            // ekf_update(sensorValue);
-            ESP_LOGI("ekf", "Stepper: %8.3fdeg, EKF: %8.3fdeg, Raw Sensor: %d, P: %.8f", 360.0 * absolutPosition / 4000.0 / 256, 360.0 * x / 2.0 / M_PI, as5600.readAngle(), P);
-        }
-        */
 }
 
 /**
@@ -671,59 +633,6 @@ double RotatorHW::correctSensorReading(double sensorReading)
     return sensorReading - err;
 }
 
-// 1) Forward model prediction
-double RotatorHW::h_meas(double x)
-{
-    double x_phase = fmodf(x, 2.0f * M_PI);
-    double s_pred = SCALE_S * x;
-    double err = C0;
-    for (int k = 1; k <= KMAX; ++k)
-    {
-        err += A[k] * cos(k * x) + B[k] * sin(k * x);
-    }
-    return s_pred + err;
-}
-
-// 2) Jacobian dh/dx
-double RotatorHW::H_jacobian(double x)
-{
-    double H = SCALE_S;
-    for (int k = 1; k <= KMAX; ++k)
-    {
-        H += -A[k] * k * sin(k * x) + B[k] * k * cos(k * x);
-    }
-    return H;
-}
-
-void RotatorHW::ekf_predict(int32_t delta_steps)
-{
-    // convert to rad
-    double u = 2 * M_PI * delta_steps / (4000.0f * 256.0f);
-    double sensorOffsetRad = 2.0f * M_PI * _zeroPosSensorOffset / 4096.0f;
-    // update state
-    x = fmod(x + u + sensorOffsetRad, 2.0f * M_PI);
-    P = P + Q;
-    ESP_LOGI("------", "x after prediction: %8.3f", 360.0 * x / 2.0 / M_PI);
-}
-
-void RotatorHW::ekf_update(double s_raw)
-{
-    // predict measurement & Jacobian
-    // double h  = h_meas(x);              // in sensor readings
-    double h = FMOD4096(409.6 * x / 2.0f / M_PI);
-    double H = H_jacobian(x);
-    // innovation and innovation covarianz
-    double y = s_raw - h;
-    double S = H * P * H + R;
-    // Kalman-gain
-    double K = P * H / S;
-    // state and covariance update
-    x = x + K * y;
-    x = fmod(x, 2.0f * M_PI);
-    P = (1.0f - K * H) * P;
-    ESP_LOGI("------", "h (Sensor Digits):  %7.2f, y: %7f", h, y);
-}
-
 RotatorHW::SensorSnapshot RotatorHW::getSensorSnapshot()
 {
     uint16_t raw = readAngleSafe();
@@ -733,6 +642,20 @@ RotatorHW::SensorSnapshot RotatorHW::getSensorSnapshot()
         getStepPositionSafe(),
         !digitalRead(HALLSENSOR), // active-low
     };
+}
+
+RotatorHW::SensorDiagnostics RotatorHW::getSensorDiagnostics()
+{
+    // Same i2cMutex as readAngleSafe() - see that function's comment for why
+    // as5600 access must not interleave across tasks.
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+    uint8_t agc = as5600.readAGC();
+    uint16_t magnitude = as5600.readMagnitude();
+    bool detected = as5600.detectMagnet();
+    bool tooStrong = as5600.magnetTooStrong();
+    bool tooWeak = as5600.magnetTooWeak();
+    xSemaphoreGive(i2cMutex);
+    return {agc, magnitude, detected, tooStrong, tooWeak};
 }
 
 void RotatorHW::jogMicrosteps(int32_t microsteps)

@@ -444,6 +444,30 @@ static esp_err_t debug_align_fullstep_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * GET /api/debug/sensor-diagnostics
+ *
+ * AS5600 magnet/airgap health straight from the chip's own AGC loop - see
+ * RotatorHW::getSensorDiagnostics(). Read-only, no motion, expert-gated like
+ * the rest of this file's raw hardware access.
+ */
+static esp_err_t debug_sensor_diagnostics_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    auto diag = RotatorHW::getInstance().getSensorDiagnostics();
+    char buf[192];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"agc\":%u,\"magnitude\":%u,\"magnetDetected\":%s,\"magnetTooStrong\":%s,\"magnetTooWeak\":%s}",
+        diag.agc, diag.magnitude,
+        diag.magnetDetected ? "true" : "false",
+        diag.magnetTooStrong ? "true" : "false",
+        diag.magnetTooWeak ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
 // WiFi Server
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
@@ -673,6 +697,12 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = debug_align_fullstep_handler};
     httpd_register_uri_handler(server, &debug_align);
+
+    httpd_uri_t debug_sensor_diagnostics = {
+        .uri = "/api/debug/sensor-diagnostics",
+        .method = HTTP_GET,
+        .handler = debug_sensor_diagnostics_handler};
+    httpd_register_uri_handler(server, &debug_sensor_diagnostics);
 
     // SSE endpoints
     httpd_uri_t zero_sse = {

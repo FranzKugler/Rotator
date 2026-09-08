@@ -34,6 +34,22 @@ public:
     };
     SensorSnapshot getSensorSnapshot();
 
+    // AS5600 magnet/airgap health, straight off the chip's own AGC closed
+    // loop (datasheet: "the gain value should be in the center of its
+    // range... adjust the airgap to achieve this value"). Never checked in
+    // this project before - a poorly seated magnet would show up here, and
+    // no amount of downstream sensor-error fitting or filtering can correct
+    // for a badly-conditioned raw measurement.
+    struct SensorDiagnostics
+    {
+        uint8_t agc;         // 0-255 (5V mode); ideally near the middle of that range
+        uint16_t magnitude;  // internal CORDIC magnitude, 0-4095
+        bool magnetDetected;
+        bool magnetTooStrong; // AGC pinned at its minimum-gain end
+        bool magnetTooWeak;   // AGC pinned at its maximum-gain end
+    };
+    SensorDiagnostics getSensorDiagnostics();
+
     // For offline calibration/filter development against an external script
     // instead of a firmware rebuild+flash+wait cycle per iteration: jog the
     // motor by a raw, signed microstep count (bypassing every degree/offset
@@ -144,11 +160,6 @@ private:
     // C0/A/B right now) against a sweep of averaged raw readings indexed by
     // ideal step position.
     ResidualStats computeResidual(const std::vector<double> &avgRaw);
-    // EKF functions
-    double h_meas(double x);
-    double H_jacobian(double x);
-    void ekf_predict(int32_t delta_steps);
-    void ekf_update(double s_raw);
 
 private:
     bool _isMoving;
@@ -174,15 +185,6 @@ private:
     double A[KMAX + 1];
     double B[KMAX + 1];
     int step_counter;
-
-    // internal Extended Kalman values
-    // process and measurement noise
-    double Q; // variance process model
-    double R; // variance sensor measurement
-
-    // Filter-Zustand
-    double x; // initial angle
-    double P; // initial variance
 
     // Instantiate TMC2209
     TMC2209 stepper_driver;
