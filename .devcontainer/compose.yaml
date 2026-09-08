@@ -15,6 +15,7 @@ services:
     command: sleep infinity
     volumes:
       - ..:/workspace
+      - ../../RotatorCam:/home/developer/RotatorCam
       - idf-cache:/home/developer/.cache/ccache
       - npm-cache:/home/developer/.npm
       - node-modules-v1:/home/developer/node_modules
