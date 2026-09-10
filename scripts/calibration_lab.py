@@ -278,6 +278,90 @@ def cmd_motor_sweep(host, sensor_model, groups=4, step_span=4, samples=15, run_i
     return results
 
 
+def cmd_fullstep_accuracy(host, revolutions=2, samples=16, fit_order=6, **_):
+    """One AS5600 reading per full step (400/motor revolution), repeated
+    `revolutions` times, to look for real motor full-step positioning error
+    (cogging - period = 1 full step, so very high spatial frequency, order
+    ~hundreds per revolution) underneath the low-order (1-6) sensor error
+    fit_fourier() already characterizes.
+
+    This can't on its own tell real motor cogging apart from a repeatable
+    AS5600 sensor defect at the same spatial frequency - the AS5600 rides the
+    motor shaft with no backlash between them, so both would look identical
+    here. That distinction doesn't matter for encoder-readback compensation
+    (nudge the commanded microstep target per full step until the AS5600
+    reads the intended value - repeatable is all that takes); it does matter
+    if the goal is the true physical full-step spacing, which needs an
+    independent check (see scripts/camera_angle_sweep.py) against a subset of
+    these points.
+    """
+    n = FULLSTEPS_PER_ROTATION
+    print(f"[fullstep-accuracy] {revolutions} revolution(s) x {n} full steps, samples={samples}/point")
+    start_pos = align_fullstep(host)["stepPosition"]
+    print(f"  aligned to true full-step position {start_pos}")
+
+    ideal = [4096.0 * i / n for i in range(n)]
+    reps_raw = []
+    t0 = time.time()
+    for rev in range(revolutions):
+        readings = []
+        for i in range(n):
+            raw = jog(host, MICROSTEPS, samples)["rawSensor"]
+            readings.append(raw)
+            if i % 100 == 0:
+                print(f"  rev {rev} step {i:4d}/{n}  raw={raw:8.2f}  ({time.time() - t0:5.1f}s elapsed)")
+        reps_raw.append(readings)
+
+    # Chunked, not a single call - JOG_LIMIT in main/WebServer.cpp's
+    # debug_jog_handler() is 2*FULLSTEPS_PER_ROTATION*MICROSTEPS, so this
+    # would silently 400 past revolutions=2.
+    remaining = -revolutions * n * MICROSTEPS
+    jog_limit = 2 * FULLSTEPS_PER_ROTATION * MICROSTEPS
+    end_pos = start_pos
+    while remaining != 0:
+        chunk = max(-jog_limit, min(jog_limit, remaining))
+        end_pos = jog(host, chunk, 1)["stepPosition"]
+        remaining -= chunk
+    check_position_roundtrip("fullstep-accuracy", start_pos, end_pos)
+    print(f"  measured in {time.time() - t0:.1f}s, returned to start")
+
+    # Fit the usual low-order model against rev 0 only - matching what a
+    # single ordinary sensor-sweep would see - so what's left below is
+    # specifically the part that fit doesn't explain, not the low-order
+    # error this project has already characterized many times over.
+    model = fit_fourier(ideal, reps_raw[0], kmax=fit_order)
+    smooth_rms, smooth_peak = residual_stats(ideal, reps_raw[0], model)
+    print(f"  rev 0: order-{fit_order} fit residual RMS={smooth_rms:.4f} deg  peak={smooth_peak:.4f} deg (motor-shaft)")
+
+    residuals = []
+    for rep in reps_raw:
+        res = [wrap4096(correct(raw, model) - ideal[i]) * DEG_PER_COUNT for i, raw in enumerate(rep)]
+        residuals.append(res)
+        rms = math.sqrt(sum(x * x for x in res) / n)
+        print(f"  rev {len(residuals) - 1} full-step residual (post-fit): RMS={rms:.4f} deg  peak={max(abs(x) for x in res):.4f} deg")
+
+    if revolutions >= 2:
+        ref = residuals[0]
+        sd_r = statistics.pstdev(ref)
+        for r in range(1, revolutions):
+            other = residuals[r]
+            diff = [o - f for o, f in zip(other, ref)]
+            diff_rms = math.sqrt(sum(d * d for d in diff) / n)
+            sd_o = statistics.pstdev(other)
+            mean_r, mean_o = statistics.mean(ref), statistics.mean(other)
+            cov = sum((f - mean_r) * (o - mean_o) for f, o in zip(ref, other)) / n
+            corr = cov / (sd_r * sd_o) if sd_r > 0 and sd_o > 0 else float("nan")
+            verdict = "repeatable - likely real & compensable" if corr > 0.7 else (
+                "weak/no repeatability - looks like noise, not a fixed per-step property")
+            print(f"  rev0 vs rev{r}: shape correlation={corr:+.3f}  diff RMS={diff_rms:.4f} deg  -> {verdict}")
+
+    return {
+        "ideal": ideal, "reps_raw": reps_raw,
+        "model": {"C0": model[0], "A": model[1], "B": model[2]},
+        "residuals_deg": residuals,
+    }
+
+
 def cmd_backlash(host, distance=2000, samples=15, repeats=3, **_):
     """Approach the same nominal position from + and - direction; the
     difference is mechanical backlash/hysteresis the sensor+motor models
@@ -306,6 +390,7 @@ COMMANDS = {
     "noise": cmd_noise,
     "sensor-sweep": cmd_sensor_sweep,
     "motor-sweep": cmd_motor_sweep,
+    "fullstep-accuracy": cmd_fullstep_accuracy,
     "backlash": cmd_backlash,
 }
 
@@ -322,6 +407,9 @@ def main():
                          help="motor-sweep: microsteps to move forward/back after align_fullstep(), "
                               "before measuring group 0, to separate driver-settling from position effects "
                               "(0 to disable)")
+    parser.add_argument("--fullstep-revolutions", type=int, default=2,
+                         help="fullstep-accuracy: motor revolutions to repeat (>=2 needed for the repeatability check)")
+    parser.add_argument("--fit-order", type=int, default=6, help="fullstep-accuracy: order of the low-order fit to subtract first")
     parser.add_argument("--distance", type=int, default=2000, help="backlash: approach distance in microsteps")
     parser.add_argument("--repeats", type=int, default=3, help="backlash: number of approach pairs")
     parser.add_argument("--load", help="reuse a prior --out JSON's sensor_sweep instead of re-sweeping")
@@ -358,6 +446,10 @@ def main():
         out["motor_sweep"] = cmd_motor_sweep(
             args.host, model, groups=args.groups, step_span=args.step_span, samples=args.samples,
             run_in_microsteps=args.run_in_microsteps,
+        )
+    if args.command in ("fullstep-accuracy", "all"):
+        out["fullstep_accuracy"] = cmd_fullstep_accuracy(
+            args.host, revolutions=args.fullstep_revolutions, samples=args.samples, fit_order=args.fit_order,
         )
     if args.command in ("backlash", "all"):
         out["backlash"] = cmd_backlash(args.host, distance=args.distance, samples=args.samples, repeats=args.repeats)

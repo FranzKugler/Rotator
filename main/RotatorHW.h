@@ -147,6 +147,21 @@ private:
     // the few call sites that already reason carefully about the consequence.
     void setStepPositionSafe(int32_t newPosition);
 
+    // Closed-loop refinement run after every MOVETO_WAIT in
+    // putRelativePosition()/putAbsolutePosition()/putMechanicalPosition():
+    // the open-loop move gets close, this measures (Kalman-filtered AS5600
+    // reading) and issues small PI-controlled corrective jogs until within
+    // tolerance or out of iterations. Ported from the live-tested Python
+    // prototype in scripts/pi_position_control.py - see
+    // CALIBRATION_FINDINGS.md for why (closed-loop measurement beat every
+    // motor/gearbox model this project tried) and for the anti-windup
+    // lesson (conditional integration - see the .cpp - is required, a plain
+    // PI overshot badly without it). Adds up to ~20 extra small moves worth
+    // of latency to a Move/MoveAbsolute/MoveMechanical call in the worst
+    // case (typically 1-3, a few hundred ms) - not yet verified against
+    // real hardware from this change.
+    void refineToTarget(long targetMotorSteps);
+
     // sensor calibration
     void calibrateAngleSensorInit(void);
     void calibrateAngleSensorStep(double sensor_raw);

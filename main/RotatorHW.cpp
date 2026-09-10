@@ -55,6 +55,33 @@ static const char *TAG = "rotator";
 #define EXPECTED_SENSORVALUE(x) ((sensorValueforMechanicalZero + int(4096.0 * fmod(x, 36.0) / 36.0)) % 4096)
 #define CORRECTED_SENSORVALUE(x) (correctSensorReading(x))
 
+// Scalar linear Kalman filter over an unwrapped OUTPUT-shaft angle (degrees) -
+// see RotatorHW::refineToTarget() and scripts/angle_filter_lab.py's
+// AngleKalman1D, which this mirrors exactly (same predict/update maths).
+// Kept local to this translation unit - only refineToTarget() needs it.
+struct AngleKalman1D
+{
+    double x = 0.0;
+    double P = 0.0;
+    double Q = 0.0;
+    double R = 0.0;
+
+    void predict(double commandedDeltaOutputDeg)
+    {
+        x += commandedDeltaOutputDeg;
+        P += Q;
+    }
+
+    void update(double measuredOutputDeg)
+    {
+        double y = measuredOutputDeg - x;
+        double S = P + R;
+        double K = (S > 0.0) ? P / S : 0.0;
+        x += K * y;
+        P *= (1.0 - K);
+    }
+};
+
 // Pins on XIAO ESP32-S3 GPIO-Numbers
 static constexpr gpio_num_t RX_PIN = GPIO_NUM_7;      // brown
 static constexpr gpio_num_t TX_PIN = GPIO_NUM_8;      // white
@@ -690,6 +717,85 @@ double RotatorHW::measureRawAngle(int samples)
     return MEASURE_PRECISE_ANGLE_DOUBLE(samples);
 }
 
+void RotatorHW::refineToTarget(long targetMotorSteps)
+{
+    // Closed-loop refinement after the open-loop MOVETO_WAIT above already
+    // got close - see RotatorHW.h's comment and CALIBRATION_FINDINGS.md.
+    // Everything here is OUTPUT-shaft degrees; DEGREE_PER_STEP already
+    // converts 1:1 between raw microsteps and output degrees (the 10:1
+    // reduction is baked into its definition above).
+    constexpr double kP = 0.9;
+    constexpr double kI = 0.15;
+    // Only accumulate the integral term while the error is already small -
+    // without this, the large error from a long move winds up the integral
+    // and then dominates the proportional term for many iterations after
+    // the error is already small, causing sustained overshoot. Found live
+    // with scripts/pi_position_control.py before this port; not a
+    // hardware issue, standard conditional-integration anti-windup.
+    constexpr double integralBandDeg = 0.05;
+    constexpr double toleranceDeg = 0.01;
+    constexpr int maxIterations = 20;
+    constexpr int sensorSamples = 8;
+    constexpr double periodDeg = 36.0; // one AS5600 revolution = 360/10 output degrees
+
+    double targetOutputDeg = (double)targetMotorSteps * DEGREE_PER_STEP;
+
+    // Seed the filter from a real measurement, wrapped to whichever
+    // physical revolution is nearest the target - safe as long as the
+    // open-loop move above landed within half an AS5600 revolution (18 deg
+    // output) of the target, true under normal operation. A larger
+    // open-loop miss (stall, lost steps) would be misread as a small error
+    // in the wrong direction - the same blind spot every modulo-based
+    // unwrap in this project has; nothing here can detect that case.
+    double correctedCounts = correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(sensorSamples));
+    double wrappedDeg = FMOD4096(correctedCounts) * periodDeg / 4096.0;
+    double diff0 = wrappedDeg - targetOutputDeg;
+    diff0 -= periodDeg * std::round(diff0 / periodDeg);
+
+    AngleKalman1D kf;
+    kf.x = targetOutputDeg + diff0;
+    kf.P = 1e-4;
+    kf.Q = 1e-7;
+    kf.R = 1e-6;
+
+    double integral = 0.0;
+    int iterationsUsed = 0;
+
+    for (int iter = 0; iter < maxIterations; ++iter)
+    {
+        double error = targetOutputDeg - kf.x;
+        if (std::fabs(error) < toleranceDeg)
+            break;
+        iterationsUsed = iter + 1;
+
+        if (std::fabs(error) < integralBandDeg)
+            integral += error;
+        double controlDeg = kP * error + kI * integral;
+        int32_t controlMicrosteps = (int32_t)std::lround(controlDeg / DEGREE_PER_STEP);
+        if (controlMicrosteps == 0)
+            controlMicrosteps = (controlDeg > 0.0) ? 1 : -1;
+
+        MOVE_WAIT(controlMicrosteps);
+        vTaskDelay(150 / portTICK_PERIOD_MS);
+
+        double commandedDeg = controlMicrosteps * DEGREE_PER_STEP;
+        kf.predict(commandedDeg);
+
+        correctedCounts = correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(sensorSamples));
+        wrappedDeg = FMOD4096(correctedCounts) * periodDeg / 4096.0;
+        double diff = wrappedDeg - kf.x;
+        diff -= periodDeg * std::round(diff / periodDeg);
+        double measuredDeg = kf.x + diff;
+        kf.update(measuredDeg);
+
+        ESP_LOGI(TAG, "refineToTarget iter %d: control=%ld us (%.4f deg) measured=%.4f estimate=%.4f error=%.4f deg",
+                 iter + 1, (long)controlMicrosteps, commandedDeg, measuredDeg, kf.x, targetOutputDeg - kf.x);
+    }
+
+    ESP_LOGI(TAG, "refineToTarget done after %d correction(s): estimate=%.4f deg (target %.4f, error %.4f deg)",
+             iterationsUsed, kf.x, targetOutputDeg, targetOutputDeg - kf.x);
+}
+
 void RotatorHW::putHalt()
 {
     // halt only if we're moving
@@ -726,6 +832,7 @@ void RotatorHW::putRelativePosition(double position)
     // and move the motor
     _isMoving = true;
     MOVETO_WAIT(targetMotorPosition);
+    refineToTarget(targetMotorPosition);
     _isMoving = false;
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE(64)));
 }
@@ -739,6 +846,7 @@ void RotatorHW::putAbsolutePosition(double position)
     // and move the motor
     _isMoving = true;
     MOVETO_WAIT(targetMotorPosition);
+    refineToTarget(targetMotorPosition);
     _isMoving = false;
     int sensorPosition = (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(64));
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d, Delta %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), sensorPosition, sensorPosition - (int)EXPECTED_SENSORVALUE(getMechanicalPosition()));
@@ -752,6 +860,7 @@ void RotatorHW::putMechanicalPosition(double position)
     // and move the motor
     _isMoving = true;
     MOVETO_WAIT(targetMotorPosition);
+    refineToTarget(targetMotorPosition);
     _isMoving = false;
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE(64)));
 }
