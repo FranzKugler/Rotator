@@ -305,12 +305,28 @@ static esp_err_t calibration_zero_stream(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Connection", "keep-alive");
 
     char buf[64];
-    // Helper, um SSE-Events zu senden und kurz zu yielden
+    // Helper, um SSE-Events zu senden und kurz zu yielden. Once the client is
+    // gone, httpd_resp_send_chunk() on the dead socket doesn't just fail
+    // quickly - each attempt blocks for a real send timeout (several hundred
+    // ms, live-measured), so a lost browser tab can turn a ~30s calibration
+    // into many minutes of the httpd worker retrying sends nobody reads. The
+    // underlying measurement must keep running regardless (its NVS result
+    // should still be good even if nobody's watching), so this only stops
+    // trying to *send* once the socket is confirmed dead - it never aborts
+    // the calibration itself.
+    bool clientGone = false;
     auto send_event = [&](const char *evt, const char *data)
     {
+        if (clientGone)
+            return;
         int len = snprintf(buf, sizeof(buf),
                            "event: %s\ndata: %s\n\n", evt, data);
-        httpd_resp_send_chunk(req, buf, len);
+        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
+        {
+            ESP_LOGW(TAG, "calibration/zero/stream: client gone, continuing without further progress events");
+            clientGone = true;
+            return;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     };
 
@@ -331,7 +347,8 @@ static esp_err_t calibration_zero_stream(httpd_req_t *req)
     snprintf(dv, sizeof(dv), "%d", zero);
     send_event("complete_zero", dv);
 
-    httpd_resp_send_chunk(req, nullptr, 0);
+    if (!clientGone)
+        httpd_resp_send_chunk(req, nullptr, 0);
     return ESP_OK;
 }
 
@@ -342,11 +359,22 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Connection", "keep-alive");
 
     char buf[256];
+    // See calibration_zero_stream()'s send_event() - same client-gone/send-
+    // timeout hazard, same fix: stop sending once the socket is dead, but
+    // let the (much longer) angle sweep keep running and persist its result.
+    bool clientGone = false;
     auto send_event = [&](const char *evt, const char *data)
     {
+        if (clientGone)
+            return;
         int len = snprintf(buf, sizeof(buf),
                            "event: %s\ndata: %s\n\n", evt, data);
-        httpd_resp_send_chunk(req, buf, len);
+        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
+        {
+            ESP_LOGW(TAG, "calibration/angle/stream: client gone, continuing without further progress events");
+            clientGone = true;
+            return;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     };
 
@@ -363,7 +391,8 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
              result.residualBeforeDeg, result.residualAfterDeg, result.peakAfterDeg);
     send_event("complete_angle", resultJson);
 
-    httpd_resp_send_chunk(req, nullptr, 0);
+    if (!clientGone)
+        httpd_resp_send_chunk(req, nullptr, 0);
     return ESP_OK;
 }
 
