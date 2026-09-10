@@ -468,6 +468,34 @@ static esp_err_t debug_sensor_diagnostics_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * POST /api/debug/goto-mechanical-zero
+ *
+ * Runs RotatorHW::gotoMechanicalZero() - the same homing routine main.cpp
+ * runs once at boot - on demand, so its repeatability can be measured
+ * without a reboot per attempt (see scripts/homing_repeatability.py).
+ * Synchronous like every other motion handler in this file: the response
+ * only arrives once homing (Hall search + the routine's own ~10s settle
+ * delay + microstep edge search) has finished, so callers need a generous
+ * timeout. Expert-gated and real motion, like the rest of this file's raw
+ * hardware access.
+ */
+static esp_err_t debug_goto_mechanical_zero_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    RotatorHW::getInstance().gotoMechanicalZero();
+    auto snapshot = RotatorHW::getInstance().getSensorSnapshot();
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"stepPosition\":%ld,\"correctedSensor\":%.3f,\"hall\":%s}",
+        (long)snapshot.stepPosition, snapshot.correctedSensor,
+        snapshot.hall ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
 // WiFi Server
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
@@ -697,6 +725,12 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_POST,
         .handler = debug_align_fullstep_handler};
     httpd_register_uri_handler(server, &debug_align);
+
+    httpd_uri_t debug_goto_zero = {
+        .uri = "/api/debug/goto-mechanical-zero",
+        .method = HTTP_POST,
+        .handler = debug_goto_mechanical_zero_handler};
+    httpd_register_uri_handler(server, &debug_goto_zero);
 
     httpd_uri_t debug_sensor_diagnostics = {
         .uri = "/api/debug/sensor-diagnostics",
