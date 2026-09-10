@@ -1,8 +1,23 @@
 #include "Configuration.hpp"
 #include "cJSON.h"
+#include "nvs.h"
 #include <fstream>
 
+namespace {
+constexpr const char *ANGLECAL_NVS_NAMESPACE = "anglecal";
+constexpr const char *ANGLECAL_NVS_KEY = "coeffs";
 
+// Raw NVS blob layout for the Fourier coefficients - fixed size, so a future
+// change to KMAX must be treated like any other persistent-format change
+// (see loadAngleCalFromNvs()'s size check, which just falls back to defaults
+// rather than misreading a differently-shaped blob).
+struct AngleCalBlob
+{
+    double C0;
+    double A[KMAX + 1];
+    double B[KMAX + 1];
+};
+} // namespace
 
 extern "C" void ConfigurationSave ()
 {
@@ -64,11 +79,20 @@ bool Configuration::mountLittleFS()
 bool Configuration::load()
 {
     std::lock_guard<std::mutex> lock(_mtx);
+
+    // Fourier coefficients: NVS is authoritative. A pre-migration device has
+    // no "anglecal" namespace yet - in that case fall back to whatever an old
+    // config.json still has (parsed below, if present) or the constructor's
+    // defaults, then persist that into NVS so this is a one-time migration.
+    bool haveAngleCal = loadAngleCalFromNvs();
+
     FILE *f = fopen("/lfs/config.json", "r");
     if (!f)
     {
         ESP_LOGW("cfg", "No config.json found");
-        return false;
+        if (!haveAngleCal)
+            saveAngleCalToNvs();
+        return haveAngleCal;
     }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
@@ -81,20 +105,29 @@ bool Configuration::load()
     if (!root)
     {
         ESP_LOGE("cfg", "cJSON_Parse error");
+        if (!haveAngleCal)
+            saveAngleCalToNvs();
         return false;
     }
 
-    // Fourier coefficients
-    _data.C0 = cJSON_GetObjectItem(root, "C0")->valuedouble;
-    cJSON *arrA = cJSON_GetObjectItem(root, "A");
-    for (int i = 0; i <= KMAX; ++i)
+    // Fourier coefficients - only consulted for migrating an old config.json
+    // that still has them; save() no longer writes them here.
+    if (!haveAngleCal)
     {
-        _data.A[i] = cJSON_GetArrayItem(arrA, i)->valuedouble;
-    }
-    cJSON *arrB = cJSON_GetObjectItem(root, "B");
-    for (int i = 0; i <= KMAX; ++i)
-    {
-        _data.B[i] = cJSON_GetArrayItem(arrB, i)->valuedouble;
+        cJSON *c0Item = cJSON_GetObjectItem(root, "C0");
+        cJSON *arrA = cJSON_GetObjectItem(root, "A");
+        cJSON *arrB = cJSON_GetObjectItem(root, "B");
+        if (c0Item && arrA && arrB)
+        {
+            _data.C0 = c0Item->valuedouble;
+            for (int i = 0; i <= KMAX; ++i)
+            {
+                _data.A[i] = cJSON_GetArrayItem(arrA, i)->valuedouble;
+                _data.B[i] = cJSON_GetArrayItem(arrB, i)->valuedouble;
+            }
+            ESP_LOGI("cfg", "Migrating Fourier coefficients from config.json into NVS");
+        }
+        saveAngleCalToNvs();
     }
 
     // Network
@@ -114,20 +147,61 @@ bool Configuration::load()
     return true;
 }
 
+bool Configuration::loadAngleCalFromNvs()
+{
+    nvs_handle_t nvs;
+    if (nvs_open(ANGLECAL_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK)
+        return false;
+    AngleCalBlob blob;
+    size_t size = sizeof(blob);
+    esp_err_t err = nvs_get_blob(nvs, ANGLECAL_NVS_KEY, &blob, &size);
+    nvs_close(nvs);
+    if (err != ESP_OK || size != sizeof(blob))
+        return false;
+    _data.C0 = blob.C0;
+    for (int i = 0; i <= KMAX; ++i)
+    {
+        _data.A[i] = blob.A[i];
+        _data.B[i] = blob.B[i];
+    }
+    return true;
+}
+
+bool Configuration::saveAngleCalToNvs() const
+{
+    nvs_handle_t nvs;
+    if (nvs_open(ANGLECAL_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK)
+    {
+        ESP_LOGE("cfg", "Could not open NVS namespace '%s' to persist angle calibration", ANGLECAL_NVS_NAMESPACE);
+        return false;
+    }
+    AngleCalBlob blob;
+    blob.C0 = _data.C0;
+    for (int i = 0; i <= KMAX; ++i)
+    {
+        blob.A[i] = _data.A[i];
+        blob.B[i] = _data.B[i];
+    }
+    esp_err_t err = nvs_set_blob(nvs, ANGLECAL_NVS_KEY, &blob, sizeof(blob));
+    if (err == ESP_OK)
+        err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("cfg", "Failed to persist angle calibration to NVS: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
 bool Configuration::save() const
 {
     std::lock_guard<std::mutex> lock(_mtx);
-    cJSON *root = cJSON_CreateObject();
 
-    // Fourier coefficients
-    cJSON_AddNumberToObject(root, "C0", _data.C0);
-    cJSON *arrA = cJSON_AddArrayToObject(root, "A");
-    cJSON *arrB = cJSON_AddArrayToObject(root, "B");
-    for (int i = 0; i <= KMAX; ++i)
-    {
-        cJSON_AddItemToArray(arrA, cJSON_CreateNumber(_data.A[i]));
-        cJSON_AddItemToArray(arrB, cJSON_CreateNumber(_data.B[i]));
-    }
+    // Fourier coefficients live in NVS, not config.json - see load().
+    saveAngleCalToNvs();
+
+    cJSON *root = cJSON_CreateObject();
 
     // Network config
     cJSON_AddStringToObject(root, "ipAddress", _data.ipAddress.c_str());

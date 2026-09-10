@@ -55,10 +55,15 @@ private:
     Configuration& operator=(const Configuration&)=delete;
 
     bool load();                  // loads /lfs/config.json
-public:    
+public:
     bool save() const;            // writes
 
 private:
+    // Fourier coefficients live in NVS ("anglecal"/"coeffs"), not config.json -
+    // see load()/save(). Called only while _mtx is already held.
+    bool loadAngleCalFromNvs();
+    bool saveAngleCalToNvs() const;
+
     mutable std::mutex _mtx;      // for thread safety
     ConfigData _data;
 };

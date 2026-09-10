@@ -106,8 +106,11 @@ self-contained; do not add runtime CDN or cloud dependencies.
 ### Persistence and networking
 
 [`main/Configuration.cpp`](main/Configuration.cpp) mounts LittleFS and stores
-angle-correction coefficients plus USB RNDIS network settings in
-`/lfs/config.json`. Wi-Fi credentials are separate and live in NVS.
+USB RNDIS network settings in `/lfs/config.json`. Angle-correction (Fourier)
+coefficients and the Hall-window mechanical-zero target are calibration
+values and live in NVS instead (`anglecal`/`coeffs`, `homing`/`zeroSensor`) -
+`load()` migrates a pre-existing config.json's coefficients into NVS once.
+Wi-Fi credentials are also NVS-based.
 
 The default USB RNDIS network is `192.168.7.1/24`. Changes to stored fields must
 update defaults, parsing, writing and any corresponding API/UI together.
