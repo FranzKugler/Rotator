@@ -129,7 +129,10 @@ describe('Sensor calibration firmware contract', () => {
       const body = fn.slice(0, fn.indexOf('\n}'));
       const liveCode = body.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
       expect(liveCode).not.toContain('stepper->getCurrentPosition()');
-      expect(body).toContain('getStepPositionSafe()');
+      // Either directly, or via getMechanicalPosition() (itself checked by
+      // this same loop) - getPosition() composes its coarse term from that
+      // wrapper rather than repeating the getStepPositionSafe() call inline.
+      expect(body).toMatch(/getStepPositionSafe\(\)|getMechanicalPosition\(\)/);
     }
   });
 

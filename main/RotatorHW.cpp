@@ -811,9 +811,28 @@ void RotatorHW::putHalt()
 
 double RotatorHW::getPosition()
 {
-    // get a snapshot of the actual position based on the stepper position and convert it to actual position
-    //return FMOD360(stepper->getCurrentPosition() * DEGREE_PER_STEP + positionOffsetToMechanicalPosition);
-    return 36 * std::floor(FMOD360(getStepPositionSafe() * DEGREE_PER_STEP) / 36 ) +  FMOD4096(correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(64))-_zeroPosSensorValue) / 4096.0 * 36.0 +  positionOffsetToMechanicalPosition;
+    // Combines the stepper's own reliable, unambiguous coarse position
+    // (getMechanicalPosition(), no AS5600 involved) with a fresh AS5600
+    // reading used only as a SMALL corrective nudge - not, as the previous
+    // version of this function did, as an independently reconstructed
+    // "which 36 degree bin am I in" value referenced against
+    // _zeroPosSensorValue. That constant has no defined relationship to
+    // getMechanicalPosition()'s own bin boundaries (stepPosition == 0), so
+    // the two terms could disagree by anywhere up to nearly a full AS5600
+    // revolution depending on exactly where the last homing happened to
+    // land; live-measured discrepancy against an independent camera
+    // reference was ~0.25-0.7 deg before this fix. The fine term below is
+    // instead computed as the shortest signed distance from the AS5600
+    // phase getMechanicalPosition() itself implies - the same
+    // ideal-vs-measured, wrap-to-nearest pattern used throughout this file
+    // (see MEASURE_PRECISE_ANGLE_DOUBLE's own "-start+6144)%4096-2048"
+    // idiom) and in RotatorHW::refineToTarget() - so it can only ever
+    // contribute a small correction, never a bin-sized jump.
+    double mechanicalPos = getMechanicalPosition();
+    double idealCounts = 4096.0 * fmod(mechanicalPos, 36.0) / 36.0;
+    double correctedCounts = correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(64));
+    double fineCorrectionDeg = (FMOD4096(correctedCounts - idealCounts + 2048.0) - 2048.0) / 4096.0 * 36.0;
+    return FMOD360(mechanicalPos + fineCorrectionDeg + positionOffsetToMechanicalPosition);
 }
 
 double RotatorHW::getMechanicalPosition()
