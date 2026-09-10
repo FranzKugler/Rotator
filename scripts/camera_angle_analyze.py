@@ -140,9 +140,13 @@ def track_rotation(sweep_dir, frames, pattern_size, verbose=True):
             "residualPx": residual,
         })
         if verbose and abs(math.degrees(theta_step)) > 10:
-            print(f"  ! large per-frame step at index {i}: {math.degrees(theta_step):.2f} deg "
-                  f"(expected roughly {fr['idealOutputDeg']:.2f} - {frames[i-1]['idealOutputDeg']:.2f} "
-                  f"= {fr['idealOutputDeg'] - frames[i-1]['idealOutputDeg']:.2f} deg) - check for a dropped/blurred frame")
+            msg = f"  ! large per-frame step at index {i}: {math.degrees(theta_step):.2f} deg"
+            if "idealOutputDeg" in fr and "idealOutputDeg" in frames[i - 1]:
+                expected = fr["idealOutputDeg"] - frames[i - 1]["idealOutputDeg"]
+                msg += f" (expected roughly {expected:.2f} deg) - check for a dropped/blurred frame"
+            else:
+                msg += " - check for a dropped/blurred frame (no idealOutputDeg on this manifest to compare against)"
+            print(msg)
 
     if n_failed:
         print(f"  {n_failed}/{len(frames)} frames failed detection")

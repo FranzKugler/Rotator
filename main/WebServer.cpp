@@ -322,6 +322,11 @@ static esp_err_t calibration_zero_stream(httpd_req_t *req)
             snprintf(d, sizeof(d), "%d", pct);
             send_event("progress", d);
         });
+    // Persists to NVS (see RotatorHW::setZeroPosSensorValue()) so this
+    // calibration survives a reboot without a firmware rebuild - and takes
+    // effect immediately in memory, so gotoMechanicalZero() uses it on the
+    // very next boot or on-demand /api/debug/goto-mechanical-zero call.
+    RotatorHW::getInstance().setZeroPosSensorValue(zero);
     char dv[8];
     snprintf(dv, sizeof(dv), "%d", zero);
     send_event("complete_zero", dv);

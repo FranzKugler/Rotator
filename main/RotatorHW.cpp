@@ -2,6 +2,7 @@
 #include "Configuration.hpp"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -128,20 +129,27 @@ RotatorHW::RotatorHW()
     }
     C0 = cfg.getC0();
 
-    // Re-measured 2026-09-08 after the config.json C0 update (16.998 -> 597.444,
-    // A/B zeroed) - this constant is a corrected-sensor-value target, so it has
-    // to move with C0 or gotoMechanicalZero()'s edge search hunts for a value
-    // that no longer occurs anywhere near the real Hall window (silently
-    // homing to whatever MOVETO_WAIT((0+0)/2) lands on instead). Found by
-    // binary-searching both edges of the Hall trigger region live via
-    // /api/debug/jog: rising (false->true) at corrected~3175.556, falling
-    // (true->false) at corrected~973.556. That is a good ~1894-count-wide
-    // triggered region (~166 motor-shaft degrees), not a narrow index pulse -
-    // this project has no independent way yet to confirm that width is
-    // correct/intended rather than a magnet/airgap issue, so this midpoint
-    // should be treated as the best available estimate, not a settled value.
+    // The corrected-sensor-value target at true mechanical zero - see
+    // measureMechanicalZero() (the calibration routine, binary-search edge
+    // finding via findEdge()) and setZeroPosSensorValue() (what persists a
+    // fresh measurement here). This used to be a hardcoded constant,
+    // requiring a firmware rebuild+reflash any time the Hall window's
+    // calibration drifted (e.g. after the config.json C0 update on
+    // 2026-09-08 that made the old hardcoded 27 stop matching the real
+    // window at all) - now loaded from NVS, falling back to 27 (that last
+    // hand-measured value) only if nothing has been calibrated yet.
     _zeroPosSensorValue = 27;
     _zeroPosSensorOffset = 27.0;
+    {
+        nvs_handle_t nvs;
+        if (nvs_open("homing", NVS_READONLY, &nvs) == ESP_OK)
+        {
+            int32_t stored = 0;
+            if (nvs_get_i32(nvs, "zeroSensor", &stored) == ESP_OK)
+                _zeroPosSensorValue = (int16_t)stored;
+            nvs_close(nvs);
+        }
+    }
 
     sensorValueforMechanicalZero = 3747;
     positionOffsetToMechanicalPosition = 20.0;
@@ -249,98 +257,130 @@ void RotatorHW::setStepPositionSafe(int32_t newPosition)
     xSemaphoreGive(stepperMutex);
 }
 
+bool RotatorHW::sweepUntilHallChange(int32_t direction, int32_t chunk, int32_t budget, int32_t debounceSteps)
+{
+    bool startState = digitalRead(HALLSENSOR);
+    int32_t traveled = 0;
+    while (traveled < budget)
+    {
+        MOVE_WAIT(direction * chunk);
+        traveled += chunk;
+        if (digitalRead(HALLSENSOR) != startState)
+        {
+            // Confirm over a further debounceSteps before trusting it - a
+            // brief electrical glitch on this GPIO (live-measured, see
+            // CALIBRATION_FINDINGS.md) would not survive this, only a real,
+            // sustained state change will.
+            MOVE_WAIT(direction * debounceSteps);
+            traveled += debounceSteps;
+            if (digitalRead(HALLSENSOR) != startState)
+                return true;
+            // false alarm - already moved past it, keep sweeping
+        }
+    }
+    return false;
+}
+
 void RotatorHW::gotoMechanicalZero()
 {
     ESP_LOGI(TAG, "Goto Mechanical Zero");
-    // move one full rotation CCW
     _isMoving = true;
-    stepper->moveTo(-STEPS_PER_ROTATION / 2);
-    bool zeroFound = true;
-    while (digitalRead(HALLSENSOR))
+
+    // ---- Which sector: find the Hall window, chunked + debounced ----
+    //
+    // This only needs to confirm we're SOMEWHERE inside the (once-per-
+    // OUTPUT-revolution) Hall window - not pinpoint an edge. That matters:
+    // an earlier version of this routine (see CALIBRATION_FINDINGS.md) spent
+    // most of its complexity, and several bugs, precisely locating both
+    // edges to derive "zero" from their midpoint. It doesn't need to -
+    // _zeroPosSensorValue already records the AS5600 reading AT true zero
+    // (from measureMechanicalZero(), which uses proper binary-search edge
+    // finding via findEdge() and persists the result - see
+    // setZeroPosSensorValue()). Once ANY point inside the window is
+    // confirmed, the AS5600 reading there uniquely determines the offset to
+    // that stored target (the window is narrower than one AS5600 revolution,
+    // so there is no ambiguity once we know we're inside the one true
+    // window, unlike matching an AS5600 value with no such confirmation
+    // first - the original bug this whole rewrite exists to fix).
+    const int32_t SECTOR_SEARCH_CHUNK = 4096;
+    const int32_t DEBOUNCE_STEPS = 2048;
+    const int32_t SECTOR_SEARCH_BUDGET = STEPS_PER_ROTATION + 20 * SECTOR_SEARCH_CHUNK + DEBOUNCE_STEPS;
+    const int MAX_ATTEMPTS = 3;
+
+    bool landedInWindow = false;
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS && !landedInWindow; ++attempt)
     {
-        if (!stepper->isRunning())
+        // true = found via the CCW sweep, false = via the CW fallback - this
+        // drives deltaSensorPos's sign below (which way "toward the
+        // calibrated target" is), not whether the search succeeded (both
+        // branches abort on failure, right where each is decided).
+        //
+        // sweepUntilHallChange() looks for the Hall state to change from
+        // whatever it is *right now* - if we're already inside the window
+        // (a real case: calling this again shortly after a previous
+        // successful call, or landing inside it by chance) that would
+        // detect *leaving* the window as "found", not entering it, and
+        // everything after would then reason from a wrong starting
+        // assumption. Live-measured: three consecutive calls, each already
+        // starting inside the window, each took ~3m42s (the two full sweep
+        // budgets on top of each other, tried MAX_ATTEMPTS times) and
+        // returned the exact same, uncorrected position every time - this
+        // check is what those calls were missing.
+        bool foundViaCCW = true;
+        if (digitalRead(HALLSENSOR)) // active-low: HIGH means NOT already inside
         {
-            ESP_LOGW(TAG, "Index not found on CCW move!");
-            zeroFound = false;
-            break;
-        }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-    if (!zeroFound)
-    {
-        stepper->moveTo(STEPS_PER_ROTATION);
-        while (digitalRead(HALLSENSOR))
-        {
-            if (!stepper->isRunning())
+            foundViaCCW = sweepUntilHallChange(-1, SECTOR_SEARCH_CHUNK, SECTOR_SEARCH_BUDGET, DEBOUNCE_STEPS);
+            if (!foundViaCCW)
             {
-                ESP_LOGW(TAG, "Index not found on CW move!");
-                break;
+                ESP_LOGW(TAG, "Index not found on CCW sweep - trying CW");
+                if (!sweepUntilHallChange(1, SECTOR_SEARCH_CHUNK, SECTOR_SEARCH_BUDGET, DEBOUNCE_STEPS))
+                {
+                    ESP_LOGW(TAG, "Index not found on CW sweep either - homing aborted, previous position kept");
+                    _isMoving = false;
+                    return;
+                }
             }
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
-    }
-
-    // stop moving and wait for stopped Motor
-    int32_t moveBack = stepper->stepsToStop();
-    stepper->stopMove();
-    WAIT_FOR_STOPPED_MOTOR;
-    if (zeroFound)
-    {
-        // found it on CCW move
-        MOVE_WAIT(moveBack);
-    }
-    else
-    {
-        // we did a full turn CW, so move back
-        MOVE_WAIT(-moveBack);
-    }
-
-    vTaskDelay(10000 / portTICK_PERIOD_MS);
-    int16_t searchDirection;
-    int32_t deltaSensorPos;
-    // allright - we're close to the sensor position, calculate the difference in steps
-    double startPos = CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(64));
-    if (zeroFound)
-    {
-        searchDirection = -1;
-        deltaSensorPos = -FMOD4096(startPos - _zeroPosSensorValue - 3) * STEPS_PER_SENSORCOUNT;
-    }
-    else
-    {
-        searchDirection = 1;
-        deltaSensorPos = FMOD4096(_zeroPosSensorValue - startPos - 3) * STEPS_PER_SENSORCOUNT;
-    }
-
-    ESP_LOGI("TAG", "StartPos=%.1f, 571, deltaSensorPos = %ld", startPos, deltaSensorPos);
-    MOVE_WAIT(deltaSensorPos);
-    int32_t firstEdge = 0;
-    int32_t secondEdge = 0;
-    int status = 0;
-    for (int i = 0; i < 300 && status < 2; i++)
-    {
-        int angle = CORRECTED_SENSORVALUE(readAngleSafe());
-        if (status == 0 && angle == _zeroPosSensorValue)
-        {
-            status = 1;
-            firstEdge = stepper->getCurrentPosition();
-            ESP_LOGI("TAG", "Step: %d Rising edge position = %ld, Sensor = %d", i, firstEdge, angle);
-        }
-        if (status == 1 && angle == _zeroPosSensorValue + searchDirection)
-        {
-            status = 2;
-            secondEdge = stepper->getCurrentPosition();
-            ESP_LOGI("TAG", "Step: %d Falling edge position = %ld, Sensor = %d", i, secondEdge, angle);
         }
 
-        MOVE_WAIT(searchDirection);
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-        ESP_LOGI("TAG", "Step: %i - Angle: %i", i, angle);
+        // ---- Exact zero: one direct move to the calibrated AS5600 target ----
+        int32_t deltaSensorPos;
+        double startPos = CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(64));
+        if (foundViaCCW)
+            deltaSensorPos = -FMOD4096(startPos - _zeroPosSensorValue - 3) * STEPS_PER_SENSORCOUNT;
+        else
+            deltaSensorPos = FMOD4096(_zeroPosSensorValue - startPos - 3) * STEPS_PER_SENSORCOUNT;
+
+        ESP_LOGI(TAG, "Inside Hall window, startPos=%.1f, moving %ld steps to calibrated zero (sensor target %d)",
+                 startPos, (long)deltaSensorPos, _zeroPosSensorValue);
+        MOVE_WAIT(deltaSensorPos);
+
+        // Sanity check: the calibrated target sits well inside the Hall
+        // window (not at its edge), so a genuinely correct landing should
+        // still read active here. Live-measured (scripts/homing_repeatability.py
+        // + camera verification, see CALIBRATION_FINDINGS.md): despite the
+        // debouncing above, roughly 1 in 5 attempts still landed ~36 degrees
+        // (one motor revolution) off, and every such case read Hall inactive
+        // at this point, while every correct landing read active - a brief
+        // electrical glitch on this GPIO occasionally still survives the
+        // sector-search debounce, but this catches it before it's trusted as
+        // "home".
+        landedInWindow = !digitalRead(HALLSENSOR);
+        if (!landedInWindow)
+            ESP_LOGW(TAG, "Landed outside the Hall window after the direct move - attempt %d/%d, retrying",
+                     attempt, MAX_ATTEMPTS);
     }
-    MOVETO_WAIT((firstEdge + secondEdge) / 2);
+    if (!landedInWindow)
+    {
+        ESP_LOGW(TAG, "Still outside the Hall window after %d attempts - homing aborted, previous position kept", MAX_ATTEMPTS);
+        _isMoving = false;
+        return;
+    }
+
     _zeroPosSensorOffset = CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(256));
 
-    ESP_LOGI("TAG", "Sensor at mechanical Zero = %f, Motor position before reset = %ld", _zeroPosSensorOffset, getStepPositionSafe());
+    ESP_LOGI(TAG, "Sensor at mechanical Zero = %f, motor position before reset = %ld", _zeroPosSensorOffset, (long)getStepPositionSafe());
     setStepPositionSafe(0);
+    _isMoving = false;
 
     /*
     // assuming that we're still in the Hallsensor "window", find the CCW magnetic edge
@@ -436,6 +476,24 @@ int RotatorHW::measureMechanicalZero(std::function<void(int)> onProgress)
     ESP_LOGI(TAG, "Averaged Sensor Position for CCW edge is %ld", ccwPosition);
     ESP_LOGI(TAG, "Sensor Value for Mechanical Zero Position is %d", sensorMechanicalZeroPosition);
     return sensorMechanicalZeroPosition;
+}
+
+void RotatorHW::setZeroPosSensorValue(int value)
+{
+    _zeroPosSensorValue = (int16_t)value;
+    nvs_handle_t nvs;
+    if (nvs_open("homing", NVS_READWRITE, &nvs) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Could not open NVS to persist zeroPosSensorValue=%d - kept in memory only", value);
+        return;
+    }
+    esp_err_t err = nvs_set_i32(nvs, "zeroSensor", value);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "Could not persist zeroPosSensorValue=%d to NVS: %s", value, esp_err_to_name(err));
+    else
+        ESP_LOGI(TAG, "Persisted zeroPosSensorValue=%d to NVS", value);
 }
 
 void RotatorHW::findEdge(bool dirCW)

@@ -109,6 +109,12 @@ public:
     double getMechanicalPosition();
     void gotoMechanicalZero();
     int measureMechanicalZero(std::function<void(int)> onProgress);
+    // Updates _zeroPosSensorValue (the corrected-sensor-value target at true
+    // mechanical zero) both in memory and in NVS, so a fresh
+    // measureMechanicalZero() result survives reboots without a firmware
+    // rebuild - see the constructor's comment on why that used to be a
+    // hardcoded constant.
+    void setZeroPosSensorValue(int value);
     // void measureMechanicalZero(int noOfMeasures = 1);
     void findEdge(bool dir);
     // void calibrateAngleSensor(void);
@@ -161,6 +167,16 @@ private:
     // case (typically 1-3, a few hundred ms) - not yet verified against
     // real hardware from this change.
     void refineToTarget(long targetMotorSteps);
+
+    // Sweeps in `direction`, `chunk` microsteps at a time (up to `budget`
+    // total), until the Hall GPIO's active/inactive state differs from
+    // whatever it was when this was called - confirmed by continuing
+    // `debounceSteps` further in the same direction and checking it still
+    // differs, not just a brief electrical glitch (live-measured on this
+    // GPIO - see CALIBRATION_FINDINGS.md). Returns false, with the caller
+    // left wherever the sweep stopped, if `budget` is exhausted without a
+    // confirmed change.
+    bool sweepUntilHallChange(int32_t direction, int32_t chunk, int32_t budget, int32_t debounceSteps);
 
     // sensor calibration
     void calibrateAngleSensorInit(void);
