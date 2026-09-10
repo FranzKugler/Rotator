@@ -1,0 +1,9 @@
+# Only scripts/camera_angle_analyze.py needs these - deliberately NOT part of
+# the ESP-IDF dev container's pinned Python env (see CLAUDE.md: don't install
+# extra Python packages on the toolchain host). Use a throwaway venv:
+#
+#   python3 -m venv /tmp/camvenv
+#   /tmp/camvenv/bin/pip install -r scripts/requirements-camera-analysis.txt
+#   /tmp/camvenv/bin/python scripts/camera_angle_analyze.py --sweep-dir ...
+numpy
+opencv-python-headless
