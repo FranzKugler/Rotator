@@ -158,6 +158,37 @@ public:
     void findEdge(bool dir);
     // void calibrateAngleSensor(void);
     CalibrationResult calibrateAngleSensor(std::function<void(int)> onProgress);
+    // Overwrites the AS5600 correction coefficients directly, updating both
+    // the live in-memory values correctSensorReading() uses immediately and
+    // NVS (so they survive a reboot) - the same two-step
+    // calibrateAngleSensorFinalize() does for an on-device sweep, exposed
+    // here for the camera-referenced offline pipeline instead
+    // (scripts/camera_angle_analyze.py's fit_fourier_against_reference(),
+    // which fits against an independent reference instead of
+    // correctSensorReading()'s only available self-referential phase basis
+    // - see CALIBRATION_FINDINGS.md's "self-referential correction bias").
+    // a/b must each have exactly KMAX+1 entries (index 0 is C0's harmonic-
+    // free sibling and is ignored, kept only for index alignment with A/B's
+    // own 1-based convention elsewhere in this file).
+    void setAngleCalCoefficients(double c0, const double a[KMAX + 1], const double b[KMAX + 1]);
+    // A second, much finer correction layered on top of C0/A/B: a
+    // zero-mean, N_STEPS-entry table indexed by which full motor step the
+    // (already C0/A/B-corrected) reading estimates it is near, added in
+    // correctSensorReading() after the smooth harmonic model. Exists
+    // because that smooth (order<=KMAX) model structurally cannot
+    // represent error that repeats once per FULL STEP rather than once per
+    // motor revolution - live-measured 2026-09-11
+    // (scripts/calibration_lab.py's fullstep-accuracy command): an order-6
+    // fit still left RMS=1.30 deg/peak=3.56 deg (motor-shaft) at full-step
+    // resolution, yet that residual correlates +1.000 between two separate
+    // measured revolutions (diff RMS only 0.049 deg) - a large but almost
+    // perfectly repeatable, and therefore almost perfectly correctable,
+    // error a low harmonic order simply cannot reach. All-zero (a no-op)
+    // until scripts/camera_fullstep_table.py's output has been uploaded via
+    // setFullStepTable(); persisted the same way as C0/A/B (live values +
+    // NVS) - see that function.
+    void setFullStepTable(const float table[N_STEPS]);
+    void getFullStepTable(float outTable[N_STEPS]);
     double correctSensorReading(double sensorReading);
     // void fitSinusoidalErrorFromSteps(const std::vector<double> &y, int N, double &out_amplitude, double &out_phase);
     void putHalt();
@@ -308,6 +339,8 @@ private:
     double A[KMAX + 1];
     double B[KMAX + 1];
     int step_counter;
+    // See setFullStepTable()'s comment.
+    float _fullStepTable[N_STEPS];
 
     // Instantiate TMC2209
     TMC2209 stepper_driver;

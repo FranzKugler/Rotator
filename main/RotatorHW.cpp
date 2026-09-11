@@ -160,6 +160,7 @@ RotatorHW::RotatorHW()
     }
     C0 = cfg.getC0();
     _nominalClockwise = cfg.getNominalClockwise();
+    cfg.getFullStepTable(_fullStepTable);
 
     // The corrected-sensor-value target at true mechanical zero - see
     // measureMechanicalZero() (the calibration routine, binary-search edge
@@ -830,6 +831,25 @@ void RotatorHW::calibrateAngleSensorFinalize(void)
     }
 }
 
+void RotatorHW::setAngleCalCoefficients(double c0, const double a[KMAX + 1], const double b[KMAX + 1])
+{
+    C0 = c0;
+    for (int k = 0; k <= KMAX; k++)
+    {
+        A[k] = a[k];
+        B[k] = b[k];
+    }
+
+    auto &cfg = Configuration::getInstance();
+    for (int k = 0; k <= KMAX; k++)
+    {
+        cfg.setA(k, A[k], false);
+        cfg.setB(k, B[k], false);
+    }
+    cfg.setC0(C0, false);
+    cfg.save();
+}
+
 RotatorHW::ResidualStats RotatorHW::computeResidual(const std::vector<double> &avgRaw)
 {
     constexpr double DEG_PER_COUNT = 360.0 / 4096.0;
@@ -855,7 +875,37 @@ double RotatorHW::correctSensorReading(double sensorReading)
     {
         err += A[k] * cos(k * theta) + B[k] * sin(k * theta);
     }
-    return sensorReading - err;
+    double smoothCorrected = sensorReading - err;
+
+    // Full-step-resolution residual layered on top of the smooth model
+    // above - see setFullStepTable()'s comment in the header for why this
+    // exists. Indexed by which of the N_STEPS full steps smoothCorrected
+    // estimates we are nearest - already a good-to-a-small-fraction-of-a-
+    // full-step estimate, since it is exactly what refineToTarget()
+    // converges position on - with linear interpolation between the two
+    // neighbouring table entries for the fractional part. All-zero (a
+    // no-op) until a table has been uploaded.
+    const double countsPerStep = 4096.0 / N_STEPS;
+    double bin = FMOD4096(smoothCorrected) / countsPerStep;
+    int bin0 = ((int)bin) % N_STEPS;
+    int bin1 = (bin0 + 1) % N_STEPS;
+    double frac = bin - (int)bin;
+    double fineErr = _fullStepTable[bin0] * (1.0 - frac) + _fullStepTable[bin1] * frac;
+
+    return smoothCorrected - fineErr;
+}
+
+void RotatorHW::setFullStepTable(const float table[N_STEPS])
+{
+    for (int i = 0; i < N_STEPS; i++)
+        _fullStepTable[i] = table[i];
+    Configuration::getInstance().setFullStepTable(_fullStepTable);
+}
+
+void RotatorHW::getFullStepTable(float outTable[N_STEPS])
+{
+    for (int i = 0; i < N_STEPS; i++)
+        outTable[i] = _fullStepTable[i];
 }
 
 RotatorHW::SensorSnapshot RotatorHW::getSensorSnapshot()
@@ -891,8 +941,16 @@ void RotatorHW::jogMicrosteps(int32_t microsteps)
     // jog, not a commanded move) - but it still issues a real stepper->move(),
     // so it needs the same motionMutex as every other such call, or it could
     // race holdTask()'s own stepper->move() for the same FastAccelStepper
-    // object while holding is active.
+    // object while holding is active. Disengaging holding here too (not just
+    // locking against it) is not optional: a calibration script that issues
+    // many jogMicrosteps() calls in a row (e.g. scripts/camera_angle_sweep.py)
+    // never updates _holdTargetSteps, so a still-active hold task would keep
+    // trying to correct back toward whatever target was active before the
+    // sweep started, physically fighting the sweep's own motion the whole
+    // time it runs - live-caught corrupting a full calibration sweep's data
+    // this way (2026-09-11) before this fix.
     MotionLock motionLock(motionMutex);
+    _holdActive = false;
     _isMoving = true;
     MOVE_WAIT(microsteps);
     _isMoving = false;

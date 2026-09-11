@@ -6,6 +6,7 @@
 namespace {
 constexpr const char *ANGLECAL_NVS_NAMESPACE = "anglecal";
 constexpr const char *ANGLECAL_NVS_KEY = "coeffs";
+constexpr const char *FULLSTEP_TABLE_NVS_KEY = "fullsteptable";
 
 // Raw NVS blob layout for the Fourier coefficients - fixed size, so a future
 // change to KMAX must be treated like any other persistent-format change
@@ -86,6 +87,10 @@ bool Configuration::load()
     // config.json still has (parsed below, if present) or the constructor's
     // defaults, then persist that into NVS so this is a one-time migration.
     bool haveAngleCal = loadAngleCalFromNvs();
+    // No config.json migration path for this one - it never lived there.
+    // Absent (pre-upload device) just leaves the constructor's all-zero
+    // default, a no-op correction, in place.
+    loadFullStepTableFromNvs();
 
     FILE *f = fopen("/lfs/config.json", "r");
     if (!f)
@@ -199,12 +204,49 @@ bool Configuration::saveAngleCalToNvs() const
     return true;
 }
 
+bool Configuration::loadFullStepTableFromNvs()
+{
+    nvs_handle_t nvs;
+    if (nvs_open(ANGLECAL_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK)
+        return false;
+    std::array<float, N_STEPS> table;
+    size_t size = table.size() * sizeof(float);
+    esp_err_t err = nvs_get_blob(nvs, FULLSTEP_TABLE_NVS_KEY, table.data(), &size);
+    nvs_close(nvs);
+    if (err != ESP_OK || size != table.size() * sizeof(float))
+        return false;
+    _data.fullStepTable = table;
+    return true;
+}
+
+bool Configuration::saveFullStepTableToNvs() const
+{
+    nvs_handle_t nvs;
+    if (nvs_open(ANGLECAL_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK)
+    {
+        ESP_LOGE("cfg", "Could not open NVS namespace '%s' to persist the full-step table", ANGLECAL_NVS_NAMESPACE);
+        return false;
+    }
+    esp_err_t err = nvs_set_blob(nvs, FULLSTEP_TABLE_NVS_KEY, _data.fullStepTable.data(),
+                                  _data.fullStepTable.size() * sizeof(float));
+    if (err == ESP_OK)
+        err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("cfg", "Failed to persist the full-step table to NVS: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
 bool Configuration::save() const
 {
     std::lock_guard<std::mutex> lock(_mtx);
 
     // Fourier coefficients live in NVS, not config.json - see load().
     saveAngleCalToNvs();
+    saveFullStepTableToNvs();
 
     cJSON *root = cJSON_CreateObject();
 
@@ -349,6 +391,22 @@ void Configuration::setNominalClockwise(bool clockwise)
     {
         std::lock_guard<std::mutex> l(_mtx);
         _data.nominalClockwise = clockwise;
+    }
+    save();
+}
+
+void Configuration::getFullStepTable(float outTable[N_STEPS]) const
+{
+    std::lock_guard<std::mutex> l(_mtx);
+    for (int i = 0; i < N_STEPS; ++i)
+        outTable[i] = _data.fullStepTable[i];
+}
+void Configuration::setFullStepTable(const float table[N_STEPS])
+{
+    {
+        std::lock_guard<std::mutex> l(_mtx);
+        for (int i = 0; i < N_STEPS; ++i)
+            _data.fullStepTable[i] = table[i];
     }
     save();
 }

@@ -24,6 +24,15 @@ struct ConfigData {
     // rotator is mounted on a given telescope), not device-specific, so it
     // lives here rather than in NVS alongside the angle-sensor calibration.
     bool nominalClockwise;
+
+    // Full-step-resolution residual correction, layered on top of C0/A/B -
+    // see RotatorHW::setFullStepTable()'s comment. All-zero (a no-op) until
+    // a camera-referenced fit has been uploaded. Appended last (not grouped
+    // with the Fourier coefficients above) so this struct's existing
+    // positional aggregate-initializer in Configuration.cpp - {C0, A, B,
+    // ipAddress, netmask, macAddress, nominalClockwise} - never has to shift
+    // when adding a field; only ever append here.
+    std::array<float, N_STEPS> fullStepTable{};
 };
 
 class Configuration {
@@ -56,6 +65,10 @@ public:
     bool getNominalClockwise() const;
     void setNominalClockwise(bool clockwise);
 
+    // Full-step correction table - see ConfigData::fullStepTable.
+    void getFullStepTable(float outTable[N_STEPS]) const;
+    void setFullStepTable(const float table[N_STEPS]);
+
 private:
     Configuration();              // mountet FS und lädt JSON
     ~Configuration();
@@ -73,6 +86,11 @@ private:
     // see load()/save(). Called only while _mtx is already held.
     bool loadAngleCalFromNvs();
     bool saveAngleCalToNvs() const;
+    // Same idea, for ConfigData::fullStepTable ("anglecal"/"fullsteptable") -
+    // no config.json migration path needed, this setting never existed
+    // there. Called only while _mtx is already held.
+    bool loadFullStepTableFromNvs();
+    bool saveFullStepTableToNvs() const;
 
     mutable std::mutex _mtx;      // for thread safety
     ConfigData _data;

@@ -217,9 +217,21 @@ static bool parse_json_body(httpd_req_t *req, cJSON **root_out)
     int len = req->content_len;
     std::string body;
     body.resize(len);
-    int ret = httpd_req_recv(req, &body[0], len);
-    if (ret <= 0)
-        return false;
+    // httpd_req_recv() is not guaranteed to return the whole body in one
+    // call - it only ever did for this project's small JSON bodies (a few
+    // hundred bytes) until /api/calibration/fullstep-table's ~4KB payload
+    // (400 numbers) exposed it: a partial recv left the rest of `body`
+    // uninitialized while parsing still used the full `len`, so every such
+    // upload failed to parse. Loop until the declared content_len is fully
+    // read (or a real error/close occurs).
+    int received = 0;
+    while (received < len)
+    {
+        int ret = httpd_req_recv(req, &body[received], len - received);
+        if (ret <= 0)
+            return false;
+        received += ret;
+    }
     *root_out = cJSON_ParseWithLength(body.c_str(), len);
     return *root_out != nullptr;
 }
@@ -345,6 +357,153 @@ static esp_err_t set_nominal_direction_handler(httpd_req_t *req)
     }
     RotatorHW::getInstance().putNominalClockwise(cJSON_IsTrue(cwItem));
     cJSON_Delete(root);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/**
+ * GET/POST /api/calibration/coefficients - {"C0": <number>, "A": [KMAX+1
+ * numbers], "B": [KMAX+1 numbers]}
+ *
+ * Reads/overwrites the AS5600 correction coefficients directly - see
+ * RotatorHW::setAngleCalCoefficients(). Meant for the camera-referenced
+ * offline calibration pipeline (scripts/camera_angle_analyze.py's
+ * fit_fourier_against_reference() + scripts/upload_angle_calibration.py),
+ * which fits against an independent reference instead of the on-device
+ * calibrateAngleSensor() sweep's only available self-referential phase
+ * basis. Expert-gated: this bypasses the normal on-device calibration flow
+ * entirely and silently trusts whatever numbers arrive, unlike that flow's
+ * own internally-consistent fit.
+ */
+static esp_err_t get_coefficients_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    auto &cfg = Configuration::getInstance();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "C0", cfg.getC0());
+    cJSON *arrA = cJSON_CreateArray();
+    cJSON *arrB = cJSON_CreateArray();
+    for (int k = 0; k <= KMAX; k++)
+    {
+        cJSON_AddItemToArray(arrA, cJSON_CreateNumber(cfg.getA(k)));
+        cJSON_AddItemToArray(arrB, cJSON_CreateNumber(cfg.getB(k)));
+    }
+    cJSON_AddItemToObject(root, "A", arrA);
+    cJSON_AddItemToObject(root, "B", arrB);
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_coefficients_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *c0Item = cJSON_GetObjectItem(root, "C0");
+    cJSON *arrA = cJSON_GetObjectItem(root, "A");
+    cJSON *arrB = cJSON_GetObjectItem(root, "B");
+    if (!cJSON_IsNumber(c0Item) || !cJSON_IsArray(arrA) || !cJSON_IsArray(arrB) ||
+        cJSON_GetArraySize(arrA) != KMAX + 1 || cJSON_GetArraySize(arrB) != KMAX + 1)
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected 'C0' (number) and 'A'/'B' (arrays of KMAX+1 numbers each)");
+        return ESP_FAIL;
+    }
+    double a[KMAX + 1], b[KMAX + 1];
+    for (int k = 0; k <= KMAX; k++)
+    {
+        cJSON *ai = cJSON_GetArrayItem(arrA, k);
+        cJSON *bi = cJSON_GetArrayItem(arrB, k);
+        if (!cJSON_IsNumber(ai) || !cJSON_IsNumber(bi))
+        {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "'A'/'B' must contain only numbers");
+            return ESP_FAIL;
+        }
+        a[k] = ai->valuedouble;
+        b[k] = bi->valuedouble;
+    }
+    double c0 = c0Item->valuedouble;
+    cJSON_Delete(root);
+
+    RotatorHW::getInstance().setAngleCalCoefficients(c0, a, b);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/**
+ * GET/POST /api/calibration/fullstep-table - {"table": [N_STEPS numbers]}
+ *
+ * Reads/overwrites the full-step-resolution residual correction layered on
+ * top of C0/A/B - see RotatorHW::setFullStepTable(). Meant for
+ * scripts/camera_fullstep_table.py's output, uploaded the same way as
+ * /api/calibration/coefficients (same expert gate, same rationale: this
+ * bypasses the normal on-device calibration flow and trusts whatever
+ * numbers arrive).
+ */
+static esp_err_t get_fullstep_table_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    float table[N_STEPS];
+    RotatorHW::getInstance().getFullStepTable(table);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < N_STEPS; i++)
+        cJSON_AddItemToArray(arr, cJSON_CreateNumber(table[i]));
+    cJSON_AddItemToObject(root, "table", arr);
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_fullstep_table_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *arr = cJSON_GetObjectItem(root, "table");
+    if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) != N_STEPS)
+    {
+        cJSON_Delete(root);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Expected 'table' as an array of %d numbers", N_STEPS);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        return ESP_FAIL;
+    }
+    float table[N_STEPS];
+    for (int i = 0; i < N_STEPS; i++)
+    {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsNumber(item))
+        {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "'table' must contain only numbers");
+            return ESP_FAIL;
+        }
+        table[i] = (float)item->valuedouble;
+    }
+    cJSON_Delete(root);
+
+    RotatorHW::getInstance().setFullStepTable(table);
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
@@ -894,6 +1053,34 @@ void register_web_handles(httpd_handle_t server)
         .handler = position_goto_handler,
         .user_ctx = NULL};
     httpd_register_uri_handler(server, &position_goto);
+
+    httpd_uri_t coefficients_get = {
+        .uri = "/api/calibration/coefficients",
+        .method = HTTP_GET,
+        .handler = get_coefficients_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &coefficients_get);
+
+    httpd_uri_t coefficients_set = {
+        .uri = "/api/calibration/coefficients",
+        .method = HTTP_POST,
+        .handler = set_coefficients_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &coefficients_set);
+
+    httpd_uri_t fullstep_table_get = {
+        .uri = "/api/calibration/fullstep-table",
+        .method = HTTP_GET,
+        .handler = get_fullstep_table_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &fullstep_table_get);
+
+    httpd_uri_t fullstep_table_set = {
+        .uri = "/api/calibration/fullstep-table",
+        .method = HTTP_POST,
+        .handler = set_fullstep_table_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &fullstep_table_set);
 
     httpd_uri_t s1 = {
         .uri = "/api/wifi/scan",
