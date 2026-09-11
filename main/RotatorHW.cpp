@@ -890,7 +890,14 @@ double RotatorHW::getPosition()
     double idealCounts = 4096.0 * fmod(mechanicalPos, 36.0) / 36.0;
     double correctedCounts = correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(64));
     double fineCorrectionDeg = (FMOD4096(correctedCounts - idealCounts + 2048.0) - 2048.0) / 4096.0 * 36.0;
-    return FMOD360(mechanicalPos + fineCorrectionDeg + positionOffsetToMechanicalPosition);
+    // Reverse (Alpaca Rotator.Reverse) flips the sign of the mechanical-to-
+    // Position mapping, independent of the Sync() offset - see
+    // putRelativePosition()/putAbsolutePosition()/putMechanicalPosition()/
+    // syncPosition() for the matching inverse/forward transforms. Sign is 1
+    // when not reversed, so this is a no-op reduction to the original
+    // formula in the (extensively tested) default case.
+    const double dir = _isReverse ? -1.0 : 1.0;
+    return FMOD360(dir * (mechanicalPos + fineCorrectionDeg) + positionOffsetToMechanicalPosition);
 }
 
 double RotatorHW::getMechanicalPosition()
@@ -902,14 +909,25 @@ double RotatorHW::getMechanicalPosition()
 
 double RotatorHW::getStepSizeDegrees()
 {
-    return DEGREE_PER_STEP;
+    // Reported per Franz's judgment call: the practically meaningful "step
+    // size" for a closed-loop rotator is the resolution of the sensor the
+    // loop actually regulates against (refineToTarget()'s AS5600 feedback),
+    // not the driver's raw microstep pitch, which is finer than anything
+    // the control loop can distinguish in a single reading. One AS5600
+    // count, at the motor shaft, is 1/10th of that on the output shaft.
+    return 360.0 / SENSORCOUNT_STEPS_PER_ROTATION / 10.0;
 }
 
 void RotatorHW::putRelativePosition(double position)
 {
+    // See getPosition()'s comment on `dir` - Reverse flips the mechanical<->
+    // Position mapping's sign, independent of the Sync() offset. No-op when
+    // not reversed.
+    const double dir = _isReverse ? -1.0 : 1.0;
+
     // calculate new positions
     _targetPosition = FMOD360(getPosition() + position);
-    long targetMotorPosition = FMOD360(_targetPosition - positionOffsetToMechanicalPosition) / DEGREE_PER_STEP;
+    long targetMotorPosition = FMOD360(dir * (_targetPosition - positionOffsetToMechanicalPosition)) / DEGREE_PER_STEP;
 
     // and move the motor
     _isMoving = true;
@@ -921,9 +939,11 @@ void RotatorHW::putRelativePosition(double position)
 
 void RotatorHW::putAbsolutePosition(double position)
 {
+    const double dir = _isReverse ? -1.0 : 1.0;
+
     // set new position
     _targetPosition = FMOD360(position);
-    long targetMotorPosition = FMOD360(_targetPosition - positionOffsetToMechanicalPosition) / DEGREE_PER_STEP;
+    long targetMotorPosition = FMOD360(dir * (_targetPosition - positionOffsetToMechanicalPosition)) / DEGREE_PER_STEP;
 
     // and move the motor
     _isMoving = true;
@@ -936,8 +956,13 @@ void RotatorHW::putAbsolutePosition(double position)
 
 void RotatorHW::putMechanicalPosition(double position)
 {
-    // calculate new position
-    _targetPosition = FMOD360(position + positionOffsetToMechanicalPosition);
+    const double dir = _isReverse ? -1.0 : 1.0;
+
+    // calculate new position - MoveMechanical's argument is already a raw
+    // mechanical angle, so only _targetPosition (the Position-space
+    // equivalent TargetPosition reports) needs the dir/offset transform;
+    // the move itself stays in mechanical space, unaffected by Reverse.
+    _targetPosition = FMOD360(dir * position + positionOffsetToMechanicalPosition);
     long targetMotorPosition = FMOD360(position) / DEGREE_PER_STEP;
     // and move the motor
     _isMoving = true;
@@ -949,5 +974,6 @@ void RotatorHW::putMechanicalPosition(double position)
 
 void RotatorHW::syncPosition(double position)
 {
-    positionOffsetToMechanicalPosition = position - getMechanicalPosition();
+    const double dir = _isReverse ? -1.0 : 1.0;
+    positionOffsetToMechanicalPosition = position - dir * getMechanicalPosition();
 }
