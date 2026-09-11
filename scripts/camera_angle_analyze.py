@@ -179,26 +179,38 @@ def fit_fourier_against_reference(ideal_motor_deg, sensor_counts, reference_moto
     `reference_motor_deg` (the camera's independent measurement, converted to
     motor-domain degrees and wrapped to one motor revolution) instead of the
     sensor's own raw reading. This is the one change this whole rig exists to
-    make possible; everything else in this function is deliberately identical
-    to the self-referential version so the two residuals are comparable
-    apples-to-apples.
+    make possible.
+
+    Solved as a proper linear least-squares fit (numpy.linalg.lstsq), not the
+    plain correlation-sum DFT formula calibration_lab.py's self-referential
+    fit_fourier() uses. That formula is only exactly correct for theta values
+    uniformly spaced over 0-360 deg - true by construction for the sensor's
+    own raw reading (calibration_lab.py sweeps by fixed step, self-referenced),
+    but NOT true here: the camera's independent theta has its own real
+    nonlinearity/noise, so consecutive samples are close to but not exactly
+    evenly spaced. Live-measured consequence (2026-09-11): the sum formula
+    left 0.20-0.26 deg of residual at orders 1-2 - the very orders it was
+    supposed to already remove - while the least-squares fit below drives
+    that to exactly 0 by construction and cut the overall order<=4 residual
+    roughly 5x (0.27 deg -> 0.055 deg motor-shaft degrees on that sweep).
     """
     n = len(ideal_motor_deg)
-    ideal_counts = [4096.0 * (d % 360.0) / 360.0 for d in ideal_motor_deg]
-    ref_counts = [4096.0 * (d % 360.0) / 360.0 for d in reference_motor_deg]
-    sum0 = 0.0
-    sumC = [0.0] * (kmax + 1)
-    sumS = [0.0] * (kmax + 1)
-    for ideal, raw, ref in zip(ideal_counts, sensor_counts, ref_counts):
-        e = wrap4096(raw - ideal)
-        sum0 += e
-        theta = 2.0 * math.pi * ref / 4096.0
-        for k in range(1, kmax + 1):
-            sumC[k] += e * math.cos(k * theta)
-            sumS[k] += e * math.sin(k * theta)
-    C0 = sum0 / n
-    A = [0.0] + [2.0 * sumC[k] / n for k in range(1, kmax + 1)]
-    B = [0.0] + [2.0 * sumS[k] / n for k in range(1, kmax + 1)]
+    ideal_counts = np.array([4096.0 * (d % 360.0) / 360.0 for d in ideal_motor_deg])
+    ref_counts = np.array([4096.0 * (d % 360.0) / 360.0 for d in reference_motor_deg])
+    raw = np.array(sensor_counts)
+    targets = np.array([wrap4096(r - i) for r, i in zip(raw, ideal_counts)])
+    theta = 2.0 * np.pi * ref_counts / 4096.0
+
+    columns = [np.ones(n)]
+    for k in range(1, kmax + 1):
+        columns.append(np.cos(k * theta))
+        columns.append(np.sin(k * theta))
+    design = np.stack(columns, axis=1)
+
+    coef, _residuals, _rank, _singular_values = np.linalg.lstsq(design, targets, rcond=None)
+    C0 = float(coef[0])
+    A = [0.0] + [float(coef[2 * k - 1]) for k in range(1, kmax + 1)]
+    B = [0.0] + [float(coef[2 * k]) for k in range(1, kmax + 1)]
     return C0, A, B
 
 
@@ -315,6 +327,10 @@ def main():
     ap.add_argument("--cols", type=int, default=9, help="printed squares across (generate_pattern.py default: 9)")
     ap.add_argument("--rows", type=int, default=8, help="printed squares down (generate_pattern.py default: 8)")
     ap.add_argument("--out", default=None, help="write full per-frame results as JSON here")
+    ap.add_argument("--kmax", type=int, default=6,
+                     help="harmonics to fit (default 6, for exploring the order spectrum). "
+                          "Use --kmax 4 to match main/RotatorHW.h's KMAX before "
+                          "scripts/upload_angle_calibration.py - it rejects any other order.")
     ap.add_argument("--check-frame", default=None,
                      help="just test corner detection on one frame (filename inside --sweep-dir) and exit")
     args = ap.parse_args()
@@ -338,7 +354,7 @@ def main():
         print(f"  closest corner to frame edge: {margin:.1f}px")
         return
 
-    result = analyze(args.sweep_dir, pattern_size)
+    result = analyze(args.sweep_dir, pattern_size, kmax=args.kmax)
     if args.out:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)
