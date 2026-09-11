@@ -126,9 +126,13 @@ public:
     double correctSensorReading(double sensorReading);
     // void fitSinusoidalErrorFromSteps(const std::vector<double> &y, int N, double &out_amplitude, double &out_phase);
     void putHalt();
-    void putRelativePosition(double position);
-    void putAbsolutePosition(double position);
-    void putMechanicalPosition(double position);
+    // Each returns false, without moving the motor or updating
+    // TargetPosition, if the requested move would take the mechanical
+    // position further than the cable-wrap motion limit from mechanical
+    // zero - see MOTION_LIMIT_DEG in RotatorHW.cpp.
+    bool putRelativePosition(double position);
+    bool putAbsolutePosition(double position);
+    bool putMechanicalPosition(double position);
     void syncPosition(double position);
 
 private:
@@ -181,6 +185,20 @@ private:
     // left wherever the sweep stopped, if `budget` is exhausted without a
     // confirmed change.
     bool sweepUntilHallChange(int32_t direction, int32_t chunk, int32_t budget, int32_t debounceSteps);
+
+    // Finds the raw motor step target, among all mechanically-equivalent
+    // candidates for the given wrapped mechanical angle (must be in
+    // [0, 360)) - candidate, candidate-360, candidate+360 - that stays
+    // within the cable-wrap motion limit, trying the shortest-path one
+    // first. On a rotator limited to little more than one full turn
+    // (MOTION_LIMIT_DEG), the shortest path is not always legal even when a
+    // longer one reaching the exact same physical orientation is - see
+    // RotatorHW.cpp. Returns false (leaving *outSteps at the shortest,
+    // illegal candidate, for logging) if no candidate is legal.
+    bool legalMotorStepsForAngle(double wrappedMechDeg, long *outSteps);
+    // True if the given raw step count is within the cable-wrap motion
+    // limit (MOTION_LIMIT_STEPS) of mechanical zero (raw step 0).
+    bool withinMotionLimit(long targetSteps);
 
     // sensor calibration
     void calibrateAngleSensorInit(void);

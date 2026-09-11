@@ -5,6 +5,7 @@
 #include "nvs.h"
 #include <vector>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 
 static const char *TAG = "rotator";
@@ -103,6 +104,19 @@ const long unsigned int STEPS_PER_ROTATION = FULLSTEPS_PER_ROTATION * 10 * MICRO
 const double DEGREE_PER_STEP = 360.0 / FULLSTEPS_PER_ROTATION / 10 / MICROSTEPS;
 const uint32_t NORMAL_MOTOR_SPEED = STEPS_PER_ROTATION / 10;
 // const long unsigned int EDGE_STEPS = 256 * 256;
+
+// Cable-wrap protection: once a camera is attached via a cable, the rotator
+// must never be commanded further than this from mechanical zero (raw step
+// 0, established by the last successful gotoMechanicalZero()) in either
+// direction - Franz's number, sized for the planned cable with some margin.
+// gotoMechanicalZero()'s boot-time sector search is bounded to the same
+// figure (search up to this far one way, then return to the boot-time start
+// and try the other way) for the same reason: two 190-degree sweeps in
+// opposite directions from one starting point cover a full revolution with
+// margin, and the sector must lie within it, since normal operation never
+// lets a completed move end up further than this from zero either.
+const double MOTION_LIMIT_DEG = 190.0;
+const long MOTION_LIMIT_STEPS = (long)(MOTION_LIMIT_DEG / DEGREE_PER_STEP);
 
 RotatorHW &RotatorHW::getInstance()
 {
@@ -304,12 +318,25 @@ void RotatorHW::gotoMechanicalZero()
     // first - the original bug this whole rewrite exists to fix).
     const int32_t SECTOR_SEARCH_CHUNK = 4096;
     const int32_t DEBOUNCE_STEPS = 2048;
-    const int32_t SECTOR_SEARCH_BUDGET = STEPS_PER_ROTATION + 20 * SECTOR_SEARCH_CHUNK + DEBOUNCE_STEPS;
+    // Bounded to the cable-wrap motion limit, not a full revolution: this
+    // search runs before mechanical zero is even known, so it can only be
+    // bounded relative to wherever boot happened to leave the rotator - see
+    // MOTION_LIMIT_DEG's comment for why two such sweeps in opposite
+    // directions, from the same start, are still guaranteed to cover the
+    // sector regardless of where it is, as long as normal operation (also
+    // limited to MOTION_LIMIT_DEG from zero) is what put the rotator here.
+    const int32_t SECTOR_SEARCH_BUDGET = MOTION_LIMIT_STEPS;
     const int MAX_ATTEMPTS = 3;
 
     bool landedInWindow = false;
     for (int attempt = 1; attempt <= MAX_ATTEMPTS && !landedInWindow; ++attempt)
     {
+        // Fixed per attempt, before either sweep moves anything - the CW
+        // fallback below returns here first, rather than continuing on from
+        // wherever the failed CCW sweep stopped, so the two sweeps' combined
+        // travel never exceeds the cable-wrap limit even in the worst case.
+        long searchStartSteps = getStepPositionSafe();
+
         // true = found via the CCW sweep, false = via the CW fallback - this
         // drives deltaSensorPos's sign below (which way "toward the
         // calibrated target" is), not whether the search succeeded (both
@@ -332,10 +359,11 @@ void RotatorHW::gotoMechanicalZero()
             foundViaCCW = sweepUntilHallChange(-1, SECTOR_SEARCH_CHUNK, SECTOR_SEARCH_BUDGET, DEBOUNCE_STEPS);
             if (!foundViaCCW)
             {
-                ESP_LOGW(TAG, "Index not found on CCW sweep - trying CW");
+                ESP_LOGW(TAG, "Index not found within %.0f deg CCW - returning to start, trying CW", MOTION_LIMIT_DEG);
+                MOVETO_WAIT(searchStartSteps);
                 if (!sweepUntilHallChange(1, SECTOR_SEARCH_CHUNK, SECTOR_SEARCH_BUDGET, DEBOUNCE_STEPS))
                 {
-                    ESP_LOGW(TAG, "Index not found on CW sweep either - homing aborted, previous position kept");
+                    ESP_LOGW(TAG, "Index not found within %.0f deg CW either - homing aborted, previous position kept", MOTION_LIMIT_DEG);
                     _isMoving = false;
                     return;
                 }
@@ -918,7 +946,42 @@ double RotatorHW::getStepSizeDegrees()
     return 360.0 / SENSORCOUNT_STEPS_PER_ROTATION / 10.0;
 }
 
-void RotatorHW::putRelativePosition(double position)
+bool RotatorHW::legalMotorStepsForAngle(double wrappedMechDeg, long *outSteps)
+{
+    long currentSteps = getStepPositionSafe();
+    double currentDeg = currentSteps * DEGREE_PER_STEP;
+    double baseDelta = wrappedMechDeg - currentDeg;
+    baseDelta -= 360.0 * std::round(baseDelta / 360.0); // shortest candidate, (-180, 180]
+
+    // Try the shortest candidate first, then its two neighbors a full turn
+    // either way, which land at the exact same physical orientation but
+    // require more travel - on this rotator (MOTION_LIMIT_DEG barely more
+    // than one full turn) that longer path can still be legal even when the
+    // shortest one exceeds the limit, e.g. current=185 deg, target=0 deg:
+    // shortest is +175 (to raw 360, illegal), but -185 (to raw 0) is legal
+    // and physically identical. Live-caught during testing, not
+    // hypothetical.
+    const double candidateOffsetsDeg[] = {0.0, -360.0, 360.0};
+    long shortest = currentSteps + std::lround(baseDelta / DEGREE_PER_STEP);
+    for (double offsetDeg : candidateOffsetsDeg)
+    {
+        long candidate = currentSteps + std::lround((baseDelta + offsetDeg) / DEGREE_PER_STEP);
+        if (withinMotionLimit(candidate))
+        {
+            *outSteps = candidate;
+            return true;
+        }
+    }
+    *outSteps = shortest;
+    return false;
+}
+
+bool RotatorHW::withinMotionLimit(long targetSteps)
+{
+    return std::labs(targetSteps) <= MOTION_LIMIT_STEPS;
+}
+
+bool RotatorHW::putRelativePosition(double position)
 {
     // See getPosition()'s comment on `dir` - Reverse flips the mechanical<->
     // Position mapping's sign, independent of the Sync() offset. No-op when
@@ -926,8 +989,16 @@ void RotatorHW::putRelativePosition(double position)
     const double dir = _isReverse ? -1.0 : 1.0;
 
     // calculate new positions
-    _targetPosition = FMOD360(getPosition() + position);
-    long targetMotorPosition = FMOD360(dir * (_targetPosition - positionOffsetToMechanicalPosition)) / DEGREE_PER_STEP;
+    double newTargetPosition = FMOD360(getPosition() + position);
+    double desiredMechDeg = FMOD360(dir * (newTargetPosition - positionOffsetToMechanicalPosition));
+    long targetMotorPosition;
+    if (!legalMotorStepsForAngle(desiredMechDeg, &targetMotorPosition))
+    {
+        ESP_LOGW(TAG, "Refusing relative move by %f deg: would reach %f deg from mechanical zero, outside +/-%.0f deg cable limit",
+                 position, targetMotorPosition * DEGREE_PER_STEP, MOTION_LIMIT_DEG);
+        return false;
+    }
+    _targetPosition = newTargetPosition;
 
     // and move the motor
     _isMoving = true;
@@ -935,15 +1006,24 @@ void RotatorHW::putRelativePosition(double position)
     refineToTarget(targetMotorPosition);
     _isMoving = false;
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE(64)));
+    return true;
 }
 
-void RotatorHW::putAbsolutePosition(double position)
+bool RotatorHW::putAbsolutePosition(double position)
 {
     const double dir = _isReverse ? -1.0 : 1.0;
 
     // set new position
-    _targetPosition = FMOD360(position);
-    long targetMotorPosition = FMOD360(dir * (_targetPosition - positionOffsetToMechanicalPosition)) / DEGREE_PER_STEP;
+    double newTargetPosition = FMOD360(position);
+    double desiredMechDeg = FMOD360(dir * (newTargetPosition - positionOffsetToMechanicalPosition));
+    long targetMotorPosition;
+    if (!legalMotorStepsForAngle(desiredMechDeg, &targetMotorPosition))
+    {
+        ESP_LOGW(TAG, "Refusing MoveAbsolute to %f deg: would reach %f deg from mechanical zero, outside +/-%.0f deg cable limit",
+                 position, targetMotorPosition * DEGREE_PER_STEP, MOTION_LIMIT_DEG);
+        return false;
+    }
+    _targetPosition = newTargetPosition;
 
     // and move the motor
     _isMoving = true;
@@ -952,24 +1032,33 @@ void RotatorHW::putAbsolutePosition(double position)
     _isMoving = false;
     int sensorPosition = (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(64));
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d, Delta %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), sensorPosition, sensorPosition - (int)EXPECTED_SENSORVALUE(getMechanicalPosition()));
+    return true;
 }
 
-void RotatorHW::putMechanicalPosition(double position)
+bool RotatorHW::putMechanicalPosition(double position)
 {
     const double dir = _isReverse ? -1.0 : 1.0;
 
-    // calculate new position - MoveMechanical's argument is already a raw
-    // mechanical angle, so only _targetPosition (the Position-space
-    // equivalent TargetPosition reports) needs the dir/offset transform;
-    // the move itself stays in mechanical space, unaffected by Reverse.
+    // MoveMechanical's argument is already a wrapped mechanical angle - no
+    // dir/offset transform needed to find the motor target itself.
+    long targetMotorPosition;
+    if (!legalMotorStepsForAngle(FMOD360(position), &targetMotorPosition))
+    {
+        ESP_LOGW(TAG, "Refusing MoveMechanical to %f deg: would reach %f deg from mechanical zero, outside +/-%.0f deg cable limit",
+                 position, targetMotorPosition * DEGREE_PER_STEP, MOTION_LIMIT_DEG);
+        return false;
+    }
+    // _targetPosition (the Position-space equivalent TargetPosition
+    // reports) needs the dir/offset transform even though the move itself
+    // doesn't.
     _targetPosition = FMOD360(dir * position + positionOffsetToMechanicalPosition);
-    long targetMotorPosition = FMOD360(position) / DEGREE_PER_STEP;
     // and move the motor
     _isMoving = true;
     MOVETO_WAIT(targetMotorPosition);
     refineToTarget(targetMotorPosition);
     _isMoving = false;
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE(64)));
+    return true;
 }
 
 void RotatorHW::syncPosition(double position)

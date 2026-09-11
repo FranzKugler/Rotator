@@ -127,18 +127,18 @@ esp_err_t RotatorApi::put_halt()
 }
 esp_err_t RotatorApi::put_move(double position)
 {
-    _rotator.putRelativePosition(position);
-    return ALPACA_OK;
+    // false means the move was refused - it would have exceeded the
+    // cable-wrap motion limit (RotatorHW.cpp's MOTION_LIMIT_DEG) - not moved
+    // partway or clamped.
+    return _rotator.putRelativePosition(position) ? ALPACA_OK : ALPACA_ERR_INVALID_OPERATION;
 }
 esp_err_t RotatorApi::put_moveabsolute(double position)
 {
-    _rotator.putAbsolutePosition(position);
-    return ALPACA_OK;
+    return _rotator.putAbsolutePosition(position) ? ALPACA_OK : ALPACA_ERR_INVALID_OPERATION;
 }
 esp_err_t RotatorApi::put_movemechanical(double position)
 {
-    _rotator.putMechanicalPosition(position);
-    return ALPACA_OK;
+    return _rotator.putMechanicalPosition(position) ? ALPACA_OK : ALPACA_ERR_INVALID_OPERATION;
 }
 esp_err_t RotatorApi::put_sync(double position)
 {
