@@ -452,7 +452,10 @@ module assembly(){
     translate([-bearing_outer_diameter/2-2.1, 0, 2.7])rotate([0,-90,0])color("black")hall_clip();
 }
 
-assembly();
+
+translate([0,0,2.8])assembly();
+
+//camera_mount();
 //small_pulley();
 //rotating_ring();
 //intersection(){
@@ -553,18 +556,3 @@ translate([40,0,0])union(){
 }
 */
 
-/*
-difference(){
-    bottom();
-    translate([-99.95,-49.95,-3])cube([24.5,21.3,3]);
-    translate([-101,-39.5,-0.7])cuboid([14,9.3,3.5], rounding=1.25, anchor=BOTTOM);
-}
-translate([-100,-50,-2]) union(){
-    difference(){
-        rotate([-90,0,180])translate([-162.2555,-153.0555,-21.3360])import("seeed-top.stl");
-        translate([0,14,0])cuboid([10,30,2], anchor=BOTTOM+RIGHT, edges=BOTTOM, chamfer=-1);
-    }
-    translate([13.8, 4.5, 5.6])rotate([-90,0,180])color("lime")import("XIAO ESP32S3.stl");
-}
-//import("seeed-bottom.3mf");
-*/
