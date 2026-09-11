@@ -61,6 +61,22 @@ public:
     double measureRawAngle(int samples = 1);
     int32_t getStepPositionSafe();
 
+    // Deliberately aggressive concurrent-load stress test for the still-open
+    // calibrateAngleSensor() hang (memory/rotator_angle_cal_hang.md,
+    // CALIBRATION_FINDINGS.md's "cross-task reliability issue"): repeats
+    // that routine's core motion (full-step mode, forwardStep(), a brief
+    // delay, an AS5600 read) `steps` times, while a dedicated auxiliary task
+    // hammers AS5600 reads via i2cMutex far more often than the normal
+    // ~650ms angle_producer_task cadence - trying to reproduce the same
+    // freeze much faster than a full ~5-9 minute calibration sweep would.
+    // `sampleCount` (vs. the real routine's fixed 64) trades measurement
+    // precision, which this test does not care about, for more repetitions
+    // per unit wall-clock time. Returns the number of steps actually
+    // completed - less than `steps` only if this itself hangs, in which
+    // case the caller never sees the return value either; onProgress is the
+    // only signal to reach the client before that point.
+    int32_t stressFullStepI2C(int32_t steps, int sampleCount, std::function<void(int)> onProgress);
+
     // A stepper motor only has FULLSTEPS_PER_ROTATION true mechanical
     // equilibrium positions - "microstep 137" is meaningless on its own, it
     // is only ever a position *within* a full step. This briefly switches
@@ -97,10 +113,29 @@ public:
     {
         _isReverse = reverse;
     }
+    // True if increasing Alpaca Position currently tracks physical clockwise
+    // rotation - the configured Nominal Direction (_nominalClockwise, see
+    // getNominalClockwise()/putNominalClockwise() below) XORed with Alpaca's
+    // own Reverse property, exactly as Franz described it: two flags, the
+    // mount-specific default and ASCOM's per-session override, combine to
+    // say what the motor actually does. Also the sign getPosition()/put*
+    // Position()/syncPosition() use for the mechanical<->Position mapping -
+    // see their shared `dir` comment.
     bool getDirection()
     {
-        return _isReverse != _isClockwise;
+        return _isReverse != _nominalClockwise;
     }
+    // Which physical rotation direction counts as "positive" (increasing
+    // Position) by default for this telescope/mount, independent of Alpaca's
+    // Reverse - see getDirection(). Persisted to LittleFS via Configuration
+    // (application-specific, not a per-device calibration value), unlike
+    // Reverse itself which Alpaca clients set per session and this firmware
+    // never persists.
+    bool getNominalClockwise()
+    {
+        return _nominalClockwise;
+    }
+    void putNominalClockwise(bool clockwise);
     double getPosition();
     double getTargetPosition()
     {
@@ -145,6 +180,23 @@ private:
     // the transaction - this is what crashed gotoMechanicalZero() a few
     // minutes after every boot before this existed.
     uint16_t readAngleSafe();
+
+    // Runs for the process lifetime once begin() starts it, at a fixed
+    // 150ms cadence (matching refineToTarget()'s own iteration period):
+    // while _holdActive is set (after a commanded move/homing settles - see
+    // put*Position()/gotoMechanicalZero()), continuously runs the same
+    // Kalman-filtered PI control law as refineToTarget() to correct for
+    // drift off the last commanded target - e.g. cable tension or an
+    // unbalanced camera slowly torquing the shaft between commands - rather
+    // than reacting to occasional, individually noisy samples. Disengaged
+    // by putHalt() and by any routine that leaves the step-position counter
+    // temporarily untrustworthy (calibrateAngleSensor(),
+    // measureMechanicalZero(), alignToFullStep(), stressFullStepI2C()) -
+    // re-engaged only by the next successful gotoMechanicalZero() or
+    // put*Position() call. Takes motionMutex only via a non-blocking try
+    // each cycle, so it can never add latency to, or deadlock with, a
+    // user-commanded operation already holding it.
+    static void holdTask(void *arg);
 
     // Same idea, for FastAccelStepper's position counter: angle_producer_task
     // reads it every 100 ms via getPosition()/getMechanicalPosition()/
@@ -217,7 +269,9 @@ private:
 private:
     bool _isMoving;
     bool _isReverse;
-    bool _isClockwise;
+    // Loaded from Configuration in the constructor, updated by
+    // putNominalClockwise() - see that method and getDirection().
+    bool _nominalClockwise;
     double _targetPosition;
 
     int16_t _zeroPosSensorValue;
@@ -229,6 +283,22 @@ private:
     double sensorCorrectionPhase;
 
     HardwareSerial &serial_stream;
+
+    // Two-state motion model, per Franz's request: a commanded move (put*
+    // Position()/gotoMechanicalZero()) drives _isMoving, and once it settles
+    // on a target, continuous holding (holdTask() above) takes over to
+    // correct for drift until the next commanded move, Halt, or maintenance
+    // routine. _holdTargetSteps is a raw motor step count, same reference
+    // frame as getStepPositionSafe() - unaffected by Reverse or Sync.
+    volatile bool _holdActive;
+    long _holdTargetSteps;
+    // Serializes every routine that issues real motor commands (stepper->
+    // move()/moveTo()/forwardStep()) against holdTask(), so continuous
+    // holding never fights an in-progress commanded move, homing sweep, or
+    // calibration sweep for the same stepper object. holdTask() only ever
+    // *tries* to take this (never blocks), so it can never add latency to,
+    // or deadlock with, a user-commanded operation.
+    SemaphoreHandle_t motionMutex;
 
     // internal calibration values
     double sumC[KMAX + 1];

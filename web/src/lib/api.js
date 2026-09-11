@@ -47,6 +47,18 @@ export function connectAngles(onAngle, locationLike = location, Socket = WebSock
   return socket;
 }
 
+export function fetchNominalDirection(fetcher = fetch) {
+  return requestJson('/api/calibration/nominal-direction', fetcher);
+}
+
+export function setNominalDirection(clockwise, fetcher = fetch) {
+  return postJson('/api/calibration/nominal-direction', { clockwise }, fetcher);
+}
+
+export function gotoPosition(position, fetcher = fetch) {
+  return postJson('/api/position/goto', { position }, fetcher);
+}
+
 export function calibrationStream(path, completeEvent, handlers, Source = EventSource) {
   const stream = new Source(path);
   stream.addEventListener('progress', ({ data }) => handlers.progress(Number(data)));

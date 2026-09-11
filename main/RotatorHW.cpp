@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include "freertos/task.h"
 
 static const char *TAG = "rotator";
 
@@ -84,6 +85,21 @@ struct AngleKalman1D
     }
 };
 
+// RAII guard for RotatorHW::motionMutex - every routine that issues real
+// motor commands takes one of these as its first statement, so the mutex is
+// released on every return path (including the early-return refusals in
+// put*Position()/gotoMechanicalZero()) without repeating xSemaphoreGive() at
+// each one.
+namespace
+{
+struct MotionLock
+{
+    SemaphoreHandle_t m;
+    explicit MotionLock(SemaphoreHandle_t m) : m(m) { xSemaphoreTake(m, portMAX_DELAY); }
+    ~MotionLock() { xSemaphoreGive(m); }
+};
+} // namespace
+
 // Pins on XIAO ESP32-S3 GPIO-Numbers
 static constexpr gpio_num_t RX_PIN = GPIO_NUM_7;      // brown
 static constexpr gpio_num_t TX_PIN = GPIO_NUM_8;      // white
@@ -125,13 +141,14 @@ RotatorHW &RotatorHW::getInstance()
 }
 
 RotatorHW::RotatorHW()
-    : _isMoving(false), _isReverse(false), _isClockwise(true), _targetPosition(0),
-      serial_stream(Serial1)
+    : _isMoving(false), _isReverse(false), _nominalClockwise(true), _targetPosition(0),
+      serial_stream(Serial1), _holdActive(false), _holdTargetSteps(0)
 {
     // Created here, before begin() brings up any task that could touch
     // as5600, so readAngleSafe() never sees a null handle.
     i2cMutex = xSemaphoreCreateMutex();
     stepperMutex = xSemaphoreCreateMutex();
+    motionMutex = xSemaphoreCreateMutex();
 
     auto &cfg = Configuration::getInstance();
 
@@ -142,6 +159,7 @@ RotatorHW::RotatorHW()
         B[k] = cfg.getB(k);
     }
     C0 = cfg.getC0();
+    _nominalClockwise = cfg.getNominalClockwise();
 
     // The corrected-sensor-value target at true mechanical zero - see
     // measureMechanicalZero() (the calibration routine, binary-search edge
@@ -231,6 +249,12 @@ void RotatorHW::begin()
     //  measureMechanicalZero(10);
     // calibrateAngleSensor();
 
+    // Continuous position holding - see holdTask()'s comment in the header
+    // and RotatorHW.h's _holdActive/_holdTargetSteps. Low priority: it sleeps
+    // almost all the time (see holdTask's idlePeriod) and only ever competes
+    // for the motor via a non-blocking mutex try.
+    xTaskCreate(holdTask, "hold", 4096, this, 1, nullptr);
+
     ESP_LOGI(TAG, "Finished intializing Rotator HW");
 }
 
@@ -297,8 +321,12 @@ bool RotatorHW::sweepUntilHallChange(int32_t direction, int32_t chunk, int32_t b
 
 void RotatorHW::gotoMechanicalZero()
 {
+    MotionLock motionLock(motionMutex);
     ESP_LOGI(TAG, "Goto Mechanical Zero");
     _isMoving = true;
+    // Untrustworthy until a fresh zero is established below - see holdTask()
+    // and this function's success/failure paths.
+    _holdActive = false;
 
     // ---- Which sector: find the Hall window, chunked + debounced ----
     //
@@ -409,6 +437,9 @@ void RotatorHW::gotoMechanicalZero()
     ESP_LOGI(TAG, "Sensor at mechanical Zero = %f, motor position before reset = %ld", _zeroPosSensorOffset, (long)getStepPositionSafe());
     setStepPositionSafe(0);
     _isMoving = false;
+    // Zero is now trustworthy - hold it until the next commanded move.
+    _holdTargetSteps = 0;
+    _holdActive = true;
 
     /*
     // assuming that we're still in the Hallsensor "window", find the CCW magnetic edge
@@ -459,6 +490,7 @@ void RotatorHW::gotoMechanicalZero()
 //void RotatorHW::measureMechanicalZero(int noOfMeasures)
 int RotatorHW::measureMechanicalZero(std::function<void(int)> onProgress)
 {
+    MotionLock motionLock(motionMutex);
     unsigned long cwPosition = 0;
     unsigned long ccwPosition = 0;
     unsigned int sensorMechanicalZeroPosition;
@@ -466,6 +498,10 @@ int RotatorHW::measureMechanicalZero(std::function<void(int)> onProgress)
 
     // we're about to move the motor
     _isMoving = true;
+    // A fresh mechanical-zero measurement is a maintenance operation, not a
+    // commanded move - disengage continuous holding until the next
+    // gotoMechanicalZero()/put*Position() re-establishes a trusted target.
+    _holdActive = false;
 
     // first to edge finding routines might not be so precisce - so skip from measurement
     findEdge(CW);
@@ -560,6 +596,66 @@ void RotatorHW::findEdge(bool dirCW)
     ESP_LOGI(TAG, "Probing position 0x%lX, Hallsensor=%d", startPosition - stepper->getCurrentPosition(), digitalRead(HALLSENSOR));
 }
 
+namespace
+{
+// Set true for the duration of a stressFullStepI2C() run; the auxiliary
+// task below polls it instead of being vTaskDelete()'d from outside, so it
+// always finishes its own current I2C read (and releases i2cMutex) before
+// exiting, rather than being torn down mid-transaction.
+volatile bool s_stressAuxRunning = false;
+
+void stressAuxI2CTask(void *arg)
+{
+    RotatorHW *self = (RotatorHW *)arg;
+    while (s_stressAuxRunning)
+    {
+        ESP_LOGI("StressTest", "aux: reading");
+        self->measureRawAngle(1);
+        ESP_LOGI("StressTest", "aux: read done");
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    vTaskDelete(NULL);
+}
+} // namespace
+
+int32_t RotatorHW::stressFullStepI2C(int32_t steps, int sampleCount, std::function<void(int)> onProgress)
+{
+    MotionLock motionLock(motionMutex);
+    _holdActive = false; // full-step mode below leaves the reference untrustworthy
+    ESP_LOGI(TAG, "Stress test starting: %ld full steps, %d-sample reads, aux I2C task every 1ms",
+             (long)steps, sampleCount);
+
+    s_stressAuxRunning = true;
+    xTaskCreate(stressAuxI2CTask, "stressAux", 4096, this, 2, nullptr);
+
+    stepper_driver.setMicrostepsPerStep(1);
+
+    int32_t completed = 0;
+    for (int32_t i = 0; i < steps; i++)
+    {
+        ESP_LOGI("StressTest", "step %ld/%ld: forwardStep", (long)(i + 1), (long)steps);
+        stepper->forwardStep();
+        ESP_LOGI("StressTest", "step %ld/%ld: forwardStep done, delay(20)", (long)(i + 1), (long)steps);
+        delay(20);
+        ESP_LOGI("StressTest", "step %ld/%ld: measuring", (long)(i + 1), (long)steps);
+        double raw = MEASURE_PRECISE_ANGLE_DOUBLE(sampleCount);
+        ESP_LOGI("StressTest", "step %ld/%ld: measured raw=%.1f", (long)(i + 1), (long)steps, raw);
+        completed = i + 1;
+        if (i % 10 == 0)
+            onProgress(100 * i / steps);
+    }
+
+    s_stressAuxRunning = false;
+    // Let the aux task see the flag and self-delete on its own next 1ms
+    // wake, rather than racing its final measureRawAngle() against this
+    // function returning and the caller possibly switching microsteps back.
+    delay(50);
+
+    stepper_driver.setMicrostepsPerStep(256);
+    ESP_LOGI(TAG, "Stress test finished: %ld/%ld steps completed", (long)completed, (long)steps);
+    return completed;
+}
+
 //void RotatorHW::calibrateAngleSensor(void)
 RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(int)> onProgress)
 {
@@ -592,6 +688,9 @@ RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(
     // C0 offset, invalidating the stored mechanical-zero reference).
     constexpr int CAL_REPEATS = 2;
 
+    MotionLock motionLock(motionMutex);
+    _holdActive = false; // full-step sweep below leaves the reference untrustworthy
+
     // set driver to fullsteps
     stepper_driver.setMicrostepsPerStep(1);
 
@@ -603,9 +702,21 @@ RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(
     {
         for (int i = 0; i < N_STEPS; i++)
         {
-            // one fullstep, measure sensor angle
+            // Fine-grained markers around each sub-operation, deliberately
+            // at INFO (DEBUG is compiled out - CONFIG_LOG_MAXIMUM_LEVEL=3):
+            // this loop is the one that has hung the device outright on
+            // 4/4 live attempts (see memory/rotator_angle_cal_hang.md), at
+            // different, unpredictable points each time, and the real
+            // rotator has no UART console - the in-memory /log ring buffer
+            // (LogBuffer.c, 200 lines) is the only way to see what the last
+            // thing running was. Whichever of these markers is the last one
+            // in the buffer after a hang narrows down which sub-operation
+            // stopped returning.
+            ESP_LOGI("Sensor Calibration", "step %d/%d: forwardStep", i + 1, N_STEPS);
             stepper->forwardStep();
+            ESP_LOGI("Sensor Calibration", "step %d/%d: forwardStep done, delay(20)", i + 1, N_STEPS);
             delay(20);
+            ESP_LOGI("Sensor Calibration", "step %d/%d: measuring (64-sample AS5600 average)", i + 1, N_STEPS);
             double raw = FMOD4096(MEASURE_PRECISE_ANGLE_DOUBLE(64));
             double ideal = 4096.0 * i / N_STEPS;
             double err = raw - ideal;
@@ -613,6 +724,7 @@ RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(
             avgErr[i] += err;
             ESP_LOGI("Sensor Calibration", "Rev %d/%d, Step: %3d, Sensor: %.1f", r + 1, CAL_REPEATS, i + 1, raw);
             onProgress(100 * (r * N_STEPS + i) / (CAL_REPEATS * N_STEPS));
+            ESP_LOGI("Sensor Calibration", "step %d/%d: progress sent", i + 1, N_STEPS);
         }
     }
     std::vector<double> avgRaw(N_STEPS);
@@ -775,6 +887,12 @@ void RotatorHW::jogMicrosteps(int32_t microsteps)
 {
     if (microsteps == 0)
         return;
+    // Bypasses _holdTargetSteps bookkeeping on purpose (this is a raw debug
+    // jog, not a commanded move) - but it still issues a real stepper->move(),
+    // so it needs the same motionMutex as every other such call, or it could
+    // race holdTask()'s own stepper->move() for the same FastAccelStepper
+    // object while holding is active.
+    MotionLock motionLock(motionMutex);
     _isMoving = true;
     MOVE_WAIT(microsteps);
     _isMoving = false;
@@ -787,7 +905,9 @@ int32_t RotatorHW::alignToFullStep()
     // queued move()+isRunning() poll measurably degraded results there when
     // tried, and this is the same driver-microstepping change applied to
     // the same live motor.
+    MotionLock motionLock(motionMutex);
     _isMoving = true;
+    _holdActive = false; // full-step switch below leaves the reference untrustworthy
     stepper_driver.setMicrostepsPerStep(1);
     stepper->forwardStep();
     delay(20);
@@ -882,8 +1002,176 @@ void RotatorHW::refineToTarget(long targetMotorSteps)
              iterationsUsed, kf.x, targetOutputDeg, targetOutputDeg - kf.x);
 }
 
+// Continuous counterpart to refineToTarget(): the same control law (an
+// AngleKalman1D running estimate plus conditional-integration PI - see that
+// function's comments for why each piece is there), but instead of iterating
+// a bounded number of times right after an open-loop move and then stopping,
+// this runs at the same fixed 150ms cadence for as long as the rotator sits
+// at a settled target (potentially hours) - Franz's point: a PI controller
+// needs an equidistant sample clock to mean anything, not an occasional
+// poll-and-nudge. kf.x is deliberately persistent across cycles (not
+// re-measured from scratch each time) so it keeps doing what a Kalman filter
+// is for - averaging down AS5600 read noise (~0.05-0.1 deg, see
+// CALIBRATION_FINDINGS.md) over many cycles rather than reacting to every
+// single noisy sample. That, not an explicit deadband, is what keeps this
+// from chattering: a lone noisy sample nudges kf.x only by the filter's own
+// (tuned, small) Kalman gain, and the resulting commanded correction is only
+// ever a whole number of microsteps - genuine, sustained drift eventually
+// pushes kf.x far enough from target to round to a real correction; noise
+// alone mostly rounds to zero and is simply absorbed into the estimate.
+void RotatorHW::holdTask(void *arg)
+{
+    RotatorHW *self = (RotatorHW *)arg;
+
+    // Same 10ms-per-sample averaging as MEASURE_PRECISE_ANGLE_DOUBLE, just
+    // callable from a static member function (that macro references
+    // readAngleSafe() unqualified, relying on an implicit `this` this
+    // function doesn't have).
+    auto measurePreciseAngle = [self](int count) -> double {
+        int32_t angle = self->readAngleSafe();
+        int32_t start = angle;
+        for (int i = 1; i < count; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            int32_t delta = (self->readAngleSafe() - start + 6144) % 4096 - 2048;
+            angle += start + delta;
+        }
+        return (double)angle / (double)count;
+    };
+
+    // Identical constants to refineToTarget() - this is the same controller,
+    // just never told to stop; reusing its already-live-tuned gains rather
+    // than inventing new ones for a "slow" variant.
+    constexpr double kP = 0.9;
+    constexpr double kI = 0.15;
+    constexpr double integralBandDeg = 0.05;
+    constexpr double periodDeg = 36.0;
+    constexpr int sensorSamples = 8;
+    const TickType_t cyclePeriod = pdMS_TO_TICKS(150);
+
+    AngleKalman1D kf;
+    double integral = 0.0;
+    bool haveEstimate = false;
+    long lastTargetSteps = 0;
+
+    while (true)
+    {
+        vTaskDelay(cyclePeriod);
+
+        if (!self->_holdActive)
+        {
+            // Reset so the next hold session always re-seeds from a fresh
+            // measurement (below) instead of resuming a stale estimate.
+            haveEstimate = false;
+            continue;
+        }
+
+        // Never block: if a commanded move, homing sweep, or calibration
+        // routine currently owns the motor, just skip this cycle - holding
+        // is a background nicety, not worth adding latency to a
+        // user-commanded operation for. The fixed cyclePeriod above still
+        // elapses regardless, so the clock itself never skips a beat even
+        // though an individual cycle's work sometimes does.
+        if (xSemaphoreTake(self->motionMutex, 0) != pdTRUE)
+            continue;
+
+        if (!self->_holdActive) // could have been cleared while waiting for the tick above
+        {
+            xSemaphoreGive(self->motionMutex);
+            haveEstimate = false;
+            continue;
+        }
+
+        long targetSteps = self->_holdTargetSteps;
+        double targetOutputDeg = (double)targetSteps * DEGREE_PER_STEP;
+
+        if (!haveEstimate || targetSteps != lastTargetSteps)
+        {
+            // (Re)seed exactly like refineToTarget()'s startup: a real
+            // measurement, wrapped to whichever AS5600 revolution is
+            // nearest the target.
+            double correctedCounts = self->correctSensorReading(measurePreciseAngle(sensorSamples));
+            double wrappedDeg = FMOD4096(correctedCounts) * periodDeg / 4096.0;
+            double diff0 = wrappedDeg - targetOutputDeg;
+            diff0 -= periodDeg * std::round(diff0 / periodDeg);
+            kf.x = targetOutputDeg + diff0;
+            kf.P = 1e-4;
+            kf.Q = 1e-7;
+            kf.R = 1e-6;
+            integral = 0.0;
+            haveEstimate = true;
+            lastTargetSteps = targetSteps;
+            xSemaphoreGive(self->motionMutex);
+            continue; // first real correction happens next cycle, against a seeded estimate
+        }
+
+        double error = targetOutputDeg - kf.x;
+        if (std::fabs(error) < integralBandDeg)
+            integral += error;
+        double controlDeg = kP * error + kI * integral;
+
+        // The PI state above (integral, and kf below) updates every cycle,
+        // unconditionally - that is what makes this a continuously-running
+        // controller rather than a periodic poll. Whether to actually move
+        // the motor is a separate question: one microstep is only ~0.00035
+        // deg, finer than the Kalman-filtered estimate's own steady-state
+        // noise (live-measured: kf.x holds within roughly +/-0.001 deg once
+        // settled) - so a naive "round to the nearest microstep and go"
+        // rounds some nonzero correction on nearly every single cycle,
+        // forever, chasing residual filter noise rather than real drift.
+        // toleranceDeg (same figure as refineToTarget()'s own convergence
+        // tolerance, confirmed comfortably above that noise floor) gates
+        // actual actuation only; a cycle below it still updates kf/integral
+        // and simply predicts a zero commanded step, so no correction is
+        // ever lost - it just accumulates until it is large enough to be a
+        // real, not illusory, correction.
+        constexpr double toleranceDeg = 0.01;
+        int32_t controlMicrosteps = (std::fabs(controlDeg) >= toleranceDeg)
+                                         ? (int32_t)std::lround(controlDeg / DEGREE_PER_STEP)
+                                         : 0;
+
+        if (controlMicrosteps != 0)
+        {
+            long newSteps = self->getStepPositionSafe() + controlMicrosteps;
+            if (self->withinMotionLimit(newSteps))
+            {
+                self->stepper->move(controlMicrosteps);
+                while (self->stepper->isRunning())
+                    vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            else
+            {
+                ESP_LOGW(TAG, "hold: drift %.4f deg from target %.4f, correction would exceed the cable limit - skipped",
+                         error, targetOutputDeg);
+                controlMicrosteps = 0; // nothing actually moved
+            }
+        }
+
+        double commandedDeg = controlMicrosteps * DEGREE_PER_STEP;
+        kf.predict(commandedDeg);
+
+        double correctedCounts = self->correctSensorReading(measurePreciseAngle(sensorSamples));
+        double wrappedDeg = FMOD4096(correctedCounts) * periodDeg / 4096.0;
+        double diff = wrappedDeg - kf.x;
+        diff -= periodDeg * std::round(diff / periodDeg);
+        double measuredDeg = kf.x + diff;
+        kf.update(measuredDeg);
+
+        if (controlMicrosteps != 0)
+            ESP_LOGI(TAG, "hold: control=%ld us (%.4f deg) estimate=%.4f target=%.4f error=%.4f deg",
+                     (long)controlMicrosteps, commandedDeg, kf.x, targetOutputDeg, error);
+
+        xSemaphoreGive(self->motionMutex);
+    }
+}
+
 void RotatorHW::putHalt()
 {
+    MotionLock motionLock(motionMutex);
+    // Halt means "stop all rotator motion now" (Alpaca semantics), not just
+    // abort an in-progress commanded move - so it also disengages continuous
+    // holding (holdTask()) until the next commanded move or homing.
+    _holdActive = false;
     // halt only if we're moving
     if (_isMoving)
     {
@@ -918,13 +1206,16 @@ double RotatorHW::getPosition()
     double idealCounts = 4096.0 * fmod(mechanicalPos, 36.0) / 36.0;
     double correctedCounts = correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(64));
     double fineCorrectionDeg = (FMOD4096(correctedCounts - idealCounts + 2048.0) - 2048.0) / 4096.0 * 36.0;
-    // Reverse (Alpaca Rotator.Reverse) flips the sign of the mechanical-to-
-    // Position mapping, independent of the Sync() offset - see
+    // Reverse (Alpaca Rotator.Reverse) and the configured Nominal Direction
+    // (Franz's per-telescope "which way is positive" setting) together flip
+    // the sign of the mechanical-to-Position mapping, independent of the
+    // Sync() offset - see getDirection()'s comment, and
     // putRelativePosition()/putAbsolutePosition()/putMechanicalPosition()/
-    // syncPosition() for the matching inverse/forward transforms. Sign is 1
-    // when not reversed, so this is a no-op reduction to the original
-    // formula in the (extensively tested) default case.
-    const double dir = _isReverse ? -1.0 : 1.0;
+    // syncPosition() for the matching inverse/forward transforms. dir is 1
+    // exactly when getDirection() is true (both flags reduce to the
+    // extensively-tested default case: Nominal Direction clockwise, Reverse
+    // false).
+    const double dir = getDirection() ? 1.0 : -1.0;
     return FMOD360(dir * (mechanicalPos + fineCorrectionDeg) + positionOffsetToMechanicalPosition);
 }
 
@@ -944,6 +1235,18 @@ double RotatorHW::getStepSizeDegrees()
     // the control loop can distinguish in a single reading. One AS5600
     // count, at the motor shaft, is 1/10th of that on the output shaft.
     return 360.0 / SENSORCOUNT_STEPS_PER_ROTATION / 10.0;
+}
+
+void RotatorHW::putNominalClockwise(bool clockwise)
+{
+    _nominalClockwise = clockwise;
+    // Application-specific (which way this particular telescope/mount calls
+    // "positive"), not a device calibration value - see Configuration.hpp's
+    // ConfigData::nominalClockwise and getDirection()'s comment. Unlike
+    // Reverse, which Alpaca clients set per session and this firmware never
+    // persists, this is meant to be set once per telescope and survive
+    // reboots.
+    Configuration::getInstance().setNominalClockwise(clockwise);
 }
 
 bool RotatorHW::legalMotorStepsForAngle(double wrappedMechDeg, long *outSteps)
@@ -983,10 +1286,11 @@ bool RotatorHW::withinMotionLimit(long targetSteps)
 
 bool RotatorHW::putRelativePosition(double position)
 {
+    MotionLock motionLock(motionMutex);
     // See getPosition()'s comment on `dir` - Reverse flips the mechanical<->
     // Position mapping's sign, independent of the Sync() offset. No-op when
     // not reversed.
-    const double dir = _isReverse ? -1.0 : 1.0;
+    const double dir = getDirection() ? 1.0 : -1.0; // see getPosition()'s comment on `dir`
 
     // calculate new positions
     double newTargetPosition = FMOD360(getPosition() + position);
@@ -1005,13 +1309,18 @@ bool RotatorHW::putRelativePosition(double position)
     MOVETO_WAIT(targetMotorPosition);
     refineToTarget(targetMotorPosition);
     _isMoving = false;
+    // Target reached - hand off to continuous holding (holdTask()) until the
+    // next commanded move, Halt, or maintenance routine.
+    _holdTargetSteps = targetMotorPosition;
+    _holdActive = true;
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE(64)));
     return true;
 }
 
 bool RotatorHW::putAbsolutePosition(double position)
 {
-    const double dir = _isReverse ? -1.0 : 1.0;
+    MotionLock motionLock(motionMutex);
+    const double dir = getDirection() ? 1.0 : -1.0; // see getPosition()'s comment on `dir`
 
     // set new position
     double newTargetPosition = FMOD360(position);
@@ -1030,6 +1339,8 @@ bool RotatorHW::putAbsolutePosition(double position)
     MOVETO_WAIT(targetMotorPosition);
     refineToTarget(targetMotorPosition);
     _isMoving = false;
+    _holdTargetSteps = targetMotorPosition;
+    _holdActive = true;
     int sensorPosition = (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE_DOUBLE(64));
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d, Delta %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), sensorPosition, sensorPosition - (int)EXPECTED_SENSORVALUE(getMechanicalPosition()));
     return true;
@@ -1037,7 +1348,8 @@ bool RotatorHW::putAbsolutePosition(double position)
 
 bool RotatorHW::putMechanicalPosition(double position)
 {
-    const double dir = _isReverse ? -1.0 : 1.0;
+    MotionLock motionLock(motionMutex);
+    const double dir = getDirection() ? 1.0 : -1.0; // see getPosition()'s comment on `dir`
 
     // MoveMechanical's argument is already a wrapped mechanical angle - no
     // dir/offset transform needed to find the motor target itself.
@@ -1057,12 +1369,14 @@ bool RotatorHW::putMechanicalPosition(double position)
     MOVETO_WAIT(targetMotorPosition);
     refineToTarget(targetMotorPosition);
     _isMoving = false;
+    _holdTargetSteps = targetMotorPosition;
+    _holdActive = true;
     ESP_LOGI(TAG, "For mechanical Position %f, Expected Sensor Value %d, Read Sensor Value %d", getMechanicalPosition(), (int)EXPECTED_SENSORVALUE(getMechanicalPosition()), (int)CORRECTED_SENSORVALUE(MEASURE_PRECISE_ANGLE(64)));
     return true;
 }
 
 void RotatorHW::syncPosition(double position)
 {
-    const double dir = _isReverse ? -1.0 : 1.0;
+    const double dir = getDirection() ? 1.0 : -1.0; // see getPosition()'s comment on `dir`
     positionOffsetToMechanicalPosition = position - dir * getMechanicalPosition();
 }

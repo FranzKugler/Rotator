@@ -39,7 +39,8 @@ Configuration::Configuration()
         {0, -6.68694199, 0.85262175, 0.86551859, 2.80138335},  //{73.7638, 155.3139, 223.4507, 277.9109},
         "192.168.7.1",
         "255.255.255.0",
-        {0x02, 0x02, 0x84, 0x6A, 0x96, 0x00}};
+        {0x02, 0x02, 0x84, 0x6A, 0x96, 0x00},
+        true}; // nominalClockwise - matches this firmware's existing, already-calibrated convention
 
     if (!mountLittleFS())
     {
@@ -134,6 +135,10 @@ bool Configuration::load()
     _data.ipAddress = cJSON_GetObjectItem(root, "ipAddress")->valuestring;
     _data.netmask = cJSON_GetObjectItem(root, "netmask")->valuestring;
     const char *macStr = cJSON_GetObjectItem(root, "macAddress")->valuestring;
+    // Absent on any config.json written before this setting existed - default
+    // to true (this firmware's existing, already-calibrated convention).
+    cJSON *nominalItem = cJSON_GetObjectItem(root, "nominalClockwise");
+    _data.nominalClockwise = nominalItem ? cJSON_IsTrue(nominalItem) : true;
     unsigned int tmp[6];
     if (sscanf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
                &tmp[0], &tmp[1], &tmp[2], &tmp[3], &tmp[4], &tmp[5]) == 6)
@@ -211,6 +216,7 @@ bool Configuration::save() const
             _data.macAddress[0], _data.macAddress[1], _data.macAddress[2],
             _data.macAddress[3], _data.macAddress[4], _data.macAddress[5]);
     cJSON_AddStringToObject(root, "macAddress", macStr);
+    cJSON_AddBoolToObject(root, "nominalClockwise", _data.nominalClockwise);
 
     char *str = cJSON_Print(root);
     ESP_LOGI("cfg", "JSON string = %s", str);
@@ -329,6 +335,20 @@ void Configuration::setMACAddress(const std::array<uint8_t, 6> &mac)
     {
         std::lock_guard<std::mutex> l(_mtx);
         _data.macAddress = mac;
+    }
+    save();
+}
+
+bool Configuration::getNominalClockwise() const
+{
+    std::lock_guard<std::mutex> l(_mtx);
+    return _data.nominalClockwise;
+}
+void Configuration::setNominalClockwise(bool clockwise)
+{
+    {
+        std::lock_guard<std::mutex> l(_mtx);
+        _data.nominalClockwise = clockwise;
     }
     save();
 }

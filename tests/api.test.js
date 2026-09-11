@@ -4,10 +4,13 @@ import {
   connectAngles,
   enrollExpert,
   fetchExpertStatus,
+  fetchNominalDirection,
   fetchOtaStatus,
+  gotoPosition,
   installUpdate,
   lockExpert,
   postJson,
+  setNominalDirection,
   setOtaConfig,
   unlockExpert,
   uploadImage
@@ -100,6 +103,40 @@ describe('OTA release channel API', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ channel: 1, autoUpdate: true, checkInterval: 24 })
+    });
+  });
+});
+
+describe('nominal direction API', () => {
+  it('loads the configured direction', async () => {
+    const fetcher = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ clockwise: false }) });
+    await expect(fetchNominalDirection(fetcher)).resolves.toEqual({ clockwise: false });
+    expect(fetcher).toHaveBeenCalledWith('/api/calibration/nominal-direction');
+  });
+
+  it('saves a new direction', async () => {
+    const fetcher = vi.fn().mockResolvedValue({ ok: true, headers: { get: () => 'text/plain' }, text: async () => 'OK' });
+    await setNominalDirection(false, fetcher);
+    expect(fetcher).toHaveBeenCalledWith('/api/calibration/nominal-direction', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clockwise: false })
+    });
+  });
+});
+
+describe('gotoPosition', () => {
+  it('posts the target angle and reports whether the move was accepted', async () => {
+    const fetcher = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ ok: true })
+    });
+    await expect(gotoPosition(123.45, fetcher)).resolves.toEqual({ ok: true });
+    expect(fetcher).toHaveBeenCalledWith('/api/position/goto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ position: 123.45 })
     });
   });
 });

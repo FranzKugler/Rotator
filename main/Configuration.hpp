@@ -17,7 +17,13 @@ struct ConfigData {
     std::string ipAddress;
     std::string netmask;
     std::array<uint8_t, 6> macAddress;
-    
+
+    // Which physical rotation direction counts as "positive" (increasing
+    // Alpaca Position) by default, for this specific telescope/mount - see
+    // RotatorHW::getDirection(). Application-specific (a property of how the
+    // rotator is mounted on a given telescope), not device-specific, so it
+    // lives here rather than in NVS alongside the angle-sensor calibration.
+    bool nominalClockwise;
 };
 
 class Configuration {
@@ -45,6 +51,10 @@ public:
     void setIPAddress(const std::string& ip);
     void setNetmask(const std::string& nm);
     void setMACAddress(const std::array<uint8_t,6>& mac);
+
+    // Nominal rotation direction - see ConfigData::nominalClockwise.
+    bool getNominalClockwise() const;
+    void setNominalClockwise(bool clockwise);
 
 private:
     Configuration();              // mountet FS und lädt JSON

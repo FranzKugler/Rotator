@@ -5,7 +5,10 @@
   import Debug from './sections/Debug.svelte';
   import Storage from './sections/Storage.svelte';
   import Expert from './sections/Expert.svelte';
-  import { calibrationStream, connectAngles, fetchExpertStatus, postJson, requestJson } from './lib/api.js';
+  import {
+    calibrationStream, connectAngles, fetchExpertStatus, fetchNominalDirection, gotoPosition,
+    postJson, requestJson, setNominalDirection
+  } from './lib/api.js';
 
   const VERSION = __ROTATOR_VERSION__;
   // The first four are always available. Update, Debug and Storage only show
@@ -48,6 +51,10 @@
   let correctedSensor = $state(0);
   let stepPosition = $state(0);
   let hallActive = $state(false);
+  let nominalClockwise = $state(true);
+  let nominalBusy = $state(false);
+  let gotoTarget = $state('');
+  let gotoBusy = $state(false);
 
   function announce(message, failed = false) {
     notice = message;
@@ -109,6 +116,33 @@
   async function saveNetwork(path, body, label) {
     try { await postJson(path, body); announce(`${label} saved`); }
     catch (reason) { announce(`${label} failed: ${reason.message}`, true); }
+  }
+
+  async function loadNominalDirection() {
+    try { nominalClockwise = Boolean((await fetchNominalDirection()).clockwise); }
+    catch (reason) { announce(`Could not load nominal direction: ${reason.message}`, true); }
+  }
+
+  async function saveNominalDirection(clockwise) {
+    nominalBusy = true;
+    try {
+      await setNominalDirection(clockwise);
+      nominalClockwise = clockwise;
+      announce(`Nominal direction saved · ${clockwise ? 'clockwise' : 'counter-clockwise'}`);
+    } catch (reason) { announce(`Nominal direction failed: ${reason.message}`, true); }
+    finally { nominalBusy = false; }
+  }
+
+  async function gotoAngle(event) {
+    event.preventDefault();
+    const value = Number(gotoTarget);
+    if (!Number.isFinite(value)) return announce('Enter a valid angle', true);
+    gotoBusy = true;
+    try {
+      const result = await gotoPosition(value);
+      announce(result.ok ? `Moved to ${value.toFixed(2)}°` : 'Move refused - outside the +/-190° cable limit', !result.ok);
+    } catch (reason) { announce(`Move failed: ${reason.message}`, true); }
+    finally { gotoBusy = false; }
   }
 
   function strongestPerName(found) {
@@ -203,6 +237,7 @@
   onMount(() => {
     loadNetwork();
     loadWifiStatus();
+    loadNominalDirection();
     fetchExpertStatus().then((next) => (expert = next)).catch(() => {
       // Not fatal, and not a reason to unlock anything: the default above
       // already says locked.
@@ -251,6 +286,14 @@
           <div class="field"><span class="key">Interface</span><span>Alpaca Rotator</span></div>
         </div>
       </div>
+    </section>
+    <section class="card">
+      <h2>Goto</h2>
+      <p class="hint">Move the rotator to a specific Position angle.</p>
+      <form onsubmit={gotoAngle}>
+        <div class="field"><label for="goto-angle">Angle (°)</label><input id="goto-angle" type="number" step="0.01" bind:value={gotoTarget} placeholder="0.00" inputmode="decimal" /></div>
+        <button type="submit" disabled={gotoBusy || gotoTarget === ''}>{gotoBusy ? 'Moving…' : 'Go'}</button>
+      </form>
     </section>
   {:else if active === 'Network'}
     <section class="card">
@@ -326,6 +369,18 @@
       <div class="field"><span class="key">Corrected sensor</span><span>{correctedSensor.toFixed(1)} / 4096</span></div>
       <div class="field"><span class="key">Motor step position</span><span>{stepPosition}</span></div>
       <div class="field"><span class="key">Hall sensor</span><span>{hallActive ? 'Active (at magnet)' : 'Inactive'}</span></div>
+    </section>
+
+    <section class="card">
+      <h2>Nominal direction</h2>
+      <p class="hint">Which physical rotation direction counts as positive (increasing Position) for this telescope - set once per mount. Alpaca's Reverse property can flip this again per session; the two combine to determine what the motor actually does.</p>
+      <div class="field">
+        <label for="nominal-direction">Direction</label>
+        <select id="nominal-direction" value={nominalClockwise ? 'cw' : 'ccw'} disabled={nominalBusy} onchange={(event) => saveNominalDirection(event.currentTarget.value === 'cw')}>
+          <option value="cw">Clockwise</option>
+          <option value="ccw">Counter-clockwise</option>
+        </select>
+      </div>
     </section>
 
     <section class="card">

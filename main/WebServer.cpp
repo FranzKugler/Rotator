@@ -84,6 +84,16 @@ void angle_producer_task(void *)
 {
     while (true)
     {
+        // Heartbeat for diagnosing main/RotatorHW.cpp's calibrateAngleSensor()
+        // hang (memory/rotator_angle_cal_hang.md) - this task runs
+        // concurrently with that sweep and is the other suspected party in
+        // CALIBRATION_FINDINGS.md's "still-unresolved cross-task reliability
+        // issue". If this line stops appearing in /log at the same moment
+        // the calibration markers do, the freeze is somewhere shared
+        // (mutex/ISR/hardware); if this keeps ticking while calibration's
+        // markers stop, the freeze is specific to that sweep's own call
+        // path. Deliberately at INFO - DEBUG is compiled out.
+        ESP_LOGI("angProd", "tick");
         auto &rotator = RotatorHW::getInstance();
         latest.angle = rotator.getPosition();
         latest.mechAngle = rotator.getMechanicalPosition();
@@ -93,6 +103,7 @@ void angle_producer_task(void *)
         latest.correctedSensor = snapshot.correctedSensor;
         latest.stepPosition = snapshot.stepPosition;
         latest.hall = snapshot.hall;
+        ESP_LOGI("angProd", "tock stepPos=%ld hall=%d", (long)latest.stepPosition, latest.hall);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -296,6 +307,82 @@ static esp_err_t set_mac_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid MAC format");
         return ESP_FAIL;
     }
+}
+
+/**
+ * GET/POST /api/calibration/nominal-direction - {"clockwise": <bool>}
+ *
+ * The Calibration tab's "Nominal Direction" setting - see
+ * RotatorHW::getNominalClockwise()/putNominalClockwise() and
+ * Configuration.hpp's ConfigData::nominalClockwise. Ordinary application
+ * configuration, not raw hardware access - not expert-gated, like the
+ * network settings above.
+ */
+static esp_err_t get_nominal_direction_handler(httpd_req_t *req)
+{
+    bool clockwise = RotatorHW::getInstance().getNominalClockwise();
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "{\"clockwise\":%s}", clockwise ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
+static esp_err_t set_nominal_direction_handler(httpd_req_t *req)
+{
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *cwItem = cJSON_GetObjectItem(root, "clockwise");
+    if (!cJSON_IsBool(cwItem))
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'clockwise'");
+        return ESP_FAIL;
+    }
+    RotatorHW::getInstance().putNominalClockwise(cJSON_IsTrue(cwItem));
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/**
+ * POST /api/position/goto - {"position": <degrees>}
+ *
+ * Manual goto for the Position tab's live-position card - drives the
+ * rotator to an absolute Alpaca Position via RotatorHW::putAbsolutePosition(),
+ * the same semantics (and cable-wrap motion limit) as Alpaca's own
+ * MoveAbsolute. Ordinary operation, not expert-gated. Synchronous like every
+ * other motion handler in this file: the response only arrives once the
+ * move and its closed-loop refinement have finished.
+ */
+static esp_err_t position_goto_handler(httpd_req_t *req)
+{
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *posItem = cJSON_GetObjectItem(root, "position");
+    if (!cJSON_IsNumber(posItem))
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'position'");
+        return ESP_FAIL;
+    }
+    double position = posItem->valuedouble;
+    cJSON_Delete(root);
+
+    bool ok = RotatorHW::getInstance().putAbsolutePosition(position);
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "{\"ok\":%s}", ok ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
 }
 
 static esp_err_t calibration_zero_stream(httpd_req_t *req)
@@ -530,6 +617,75 @@ static esp_err_t debug_goto_mechanical_zero_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * POST /api/debug/stress-fullstep-i2c - {"steps": <int, default 2000>,
+ * "sampleCount": <int, default 4>}
+ *
+ * Deliberately aggressive reproduction attempt for the still-open
+ * calibrateAngleSensor() hang (memory/rotator_angle_cal_hang.md) - see
+ * RotatorHW::stressFullStepI2C(). SSE progress, same client-gone/send-
+ * timeout fix as the calibration streams, since this is meant to run
+ * unattended for a while. Expert-gated and real motion, like the rest of
+ * this file's raw hardware access.
+ */
+static esp_err_t debug_stress_fullstep_i2c_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *stepsItem = cJSON_GetObjectItem(root, "steps");
+    cJSON *sampleCountItem = cJSON_GetObjectItem(root, "sampleCount");
+    int32_t steps = cJSON_IsNumber(stepsItem) ? (int32_t)stepsItem->valuedouble : 2000;
+    int sampleCount = cJSON_IsNumber(sampleCountItem) ? (int)sampleCountItem->valuedouble : 4;
+    cJSON_Delete(root);
+    if (steps < 1 || steps > 20000 || sampleCount < 1 || sampleCount > 64)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "steps or sampleCount out of range");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+
+    char buf[64];
+    bool clientGone = false;
+    auto send_event = [&](const char *evt, const char *data)
+    {
+        if (clientGone)
+            return;
+        int len = snprintf(buf, sizeof(buf), "event: %s\ndata: %s\n\n", evt, data);
+        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
+        {
+            ESP_LOGW(TAG, "debug/stress-fullstep-i2c: client gone, continuing without further progress events");
+            clientGone = true;
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    };
+
+    int32_t completed = RotatorHW::getInstance().stressFullStepI2C(
+        steps, sampleCount,
+        [&](int pct)
+        {
+            char d[8];
+            snprintf(d, sizeof(d), "%d", pct);
+            send_event("progress", d);
+        });
+    char resultJson[64];
+    snprintf(resultJson, sizeof(resultJson), "{\"completed\":%ld,\"steps\":%ld}", (long)completed, (long)steps);
+    send_event("complete_stress", resultJson);
+
+    if (!clientGone)
+        httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
 // WiFi Server
 static esp_err_t wifi_status_handler(httpd_req_t *req)
 {
@@ -718,6 +874,27 @@ void register_web_handles(httpd_handle_t server)
         .user_ctx = NULL};
     httpd_register_uri_handler(server, &mac_uri);
 
+    httpd_uri_t nominal_direction_get = {
+        .uri = "/api/calibration/nominal-direction",
+        .method = HTTP_GET,
+        .handler = get_nominal_direction_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &nominal_direction_get);
+
+    httpd_uri_t nominal_direction_set = {
+        .uri = "/api/calibration/nominal-direction",
+        .method = HTTP_POST,
+        .handler = set_nominal_direction_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &nominal_direction_set);
+
+    httpd_uri_t position_goto = {
+        .uri = "/api/position/goto",
+        .method = HTTP_POST,
+        .handler = position_goto_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &position_goto);
+
     httpd_uri_t s1 = {
         .uri = "/api/wifi/scan",
         .method = HTTP_GET,
@@ -771,6 +948,12 @@ void register_web_handles(httpd_handle_t server)
         .method = HTTP_GET,
         .handler = debug_sensor_diagnostics_handler};
     httpd_register_uri_handler(server, &debug_sensor_diagnostics);
+
+    httpd_uri_t debug_stress_fullstep_i2c = {
+        .uri = "/api/debug/stress-fullstep-i2c",
+        .method = HTTP_POST,
+        .handler = debug_stress_fullstep_i2c_handler};
+    httpd_register_uri_handler(server, &debug_stress_fullstep_i2c);
 
     // SSE endpoints
     httpd_uri_t zero_sse = {
