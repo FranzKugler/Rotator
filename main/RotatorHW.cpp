@@ -897,7 +897,12 @@ double RotatorHW::getMechanicalPosition()
 {
     // get a snapshot of the actual position based on the stepper position
     return (double)FMOD360(getStepPositionSafe() * DEGREE_PER_STEP);
-    
+
+}
+
+double RotatorHW::getStepSizeDegrees()
+{
+    return DEGREE_PER_STEP;
 }
 
 void RotatorHW::putRelativePosition(double position)

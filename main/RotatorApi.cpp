@@ -15,17 +15,20 @@ esp_err_t RotatorApi::action(const char *action, const char *parameters, char *b
 
 esp_err_t RotatorApi::commandblind(const char *command, bool raw)
 {
-    return ALPACA_ERR_ACTION_NOT_IMPLEMENTED;
+    // Unlike Action() (ActionNotImplementedException, for an unrecognized
+    // action name), this driver supports no CommandBlind/Bool/String calls
+    // at all - that's NotImplementedException, per the Alpaca spec.
+    return ALPACA_ERR_NOT_IMPLEMENTED;
 }
 
 esp_err_t RotatorApi::commandbool(const char *command, bool raw, bool *resp)
 {
-    return ALPACA_ERR_ACTION_NOT_IMPLEMENTED;
+    return ALPACA_ERR_NOT_IMPLEMENTED;
 }
 
 esp_err_t RotatorApi::commandstring(const char *action, bool raw, char *buf, size_t len)
 {
-    return ALPACA_ERR_ACTION_NOT_IMPLEMENTED;
+    return ALPACA_ERR_NOT_IMPLEMENTED;
 }
 
 esp_err_t RotatorApi::get_connected(bool *connected)
@@ -109,7 +112,7 @@ esp_err_t RotatorApi::put_reverse(bool reverse)
 }
 esp_err_t RotatorApi::get_stepsize(double *stepsize)
 {
-    *stepsize = 0.02;
+    *stepsize = _rotator.getStepSizeDegrees();
     return ALPACA_OK;
 }
 esp_err_t RotatorApi::get_targetposition(double *targetposition)

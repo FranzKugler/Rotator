@@ -3457,6 +3457,36 @@ esp_err_t Api::handle_get_observingconditions_timesincelastupdate(httpd_req_t *r
 
 // Rotator API
 
+// Every Rotator property and method requires the device to be Connected
+// first, per the Alpaca spec and the ASCOM reference implementation
+// (AlpycaDevice) - except CanReverse, a static capability that reference
+// implementation deliberately returns regardless of connection state.
+static bool rotator_require_connected(Rotator *rotator, cJSON *root)
+{
+    bool connected = false;
+    if (!check_return(rotator->get_connected(&connected), root))
+        return false;
+    if (!connected)
+    {
+        set_error(ALPACA_ERR_NOT_CONNECTED, root);
+        return false;
+    }
+    return true;
+}
+
+// MoveAbsolute/MoveMechanical/Sync take an absolute position and must
+// reject one outside [0, 360) with InvalidValueException, per the Alpaca
+// spec - unlike Move()'s relative delta, which accepts any value and wraps.
+static bool rotator_require_valid_absolute_position(double position, cJSON *root)
+{
+    if (position < 0.0 || position >= 360.0)
+    {
+        set_error(ALPACA_ERR_INVALID_VALUE, root);
+        return false;
+    }
+    return true;
+}
+
 esp_err_t Api::handle_get_rotator_canreverse(httpd_req_t *req)
 {
     Api *api = (Api *)req->user_ctx;
@@ -3505,10 +3535,13 @@ esp_err_t Api::handle_get_rotator_ismoving(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        bool ismoving = false;
-        if (check_return(rotator->get_ismoving(&ismoving), root))
+        if (rotator_require_connected(rotator, root))
         {
-            cJSON_AddBoolToObject(root, "Value", ismoving);
+            bool ismoving = false;
+            if (check_return(rotator->get_ismoving(&ismoving), root))
+            {
+                cJSON_AddBoolToObject(root, "Value", ismoving);
+            }
         }
     }
     else
@@ -3536,10 +3569,13 @@ esp_err_t Api::handle_get_rotator_mechanicalposition(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        double mechanicalposition = 0;
-        if (check_return(rotator->get_mechanicalposition(&mechanicalposition), root))
+        if (rotator_require_connected(rotator, root))
         {
-            cJSON_AddNumberToObject(root, "Value", mechanicalposition);
+            double mechanicalposition = 0;
+            if (check_return(rotator->get_mechanicalposition(&mechanicalposition), root))
+            {
+                cJSON_AddNumberToObject(root, "Value", mechanicalposition);
+            }
         }
     }
     else
@@ -3567,10 +3603,13 @@ esp_err_t Api::handle_get_rotator_position(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        double position = 0;
-        if (check_return(rotator->get_position(&position), root))
+        if (rotator_require_connected(rotator, root))
         {
-            cJSON_AddNumberToObject(root, "Value", position);
+            double position = 0;
+            if (check_return(rotator->get_position(&position), root))
+            {
+                cJSON_AddNumberToObject(root, "Value", position);
+            }
         }
     }
     else
@@ -3598,10 +3637,13 @@ esp_err_t Api::handle_get_rotator_reverse(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        bool reverse = false;
-        if (check_return(rotator->get_reverse(&reverse), root))
+        if (rotator_require_connected(rotator, root))
         {
-            cJSON_AddBoolToObject(root, "Value", reverse);
+            bool reverse = false;
+            if (check_return(rotator->get_reverse(&reverse), root))
+            {
+                cJSON_AddBoolToObject(root, "Value", reverse);
+            }
         }
     }
     else
@@ -3630,11 +3672,14 @@ esp_err_t Api::handle_put_rotator_reverse(httpd_req_t *req)
         Rotator *rotator = (Rotator *)device;
 
         char *reverse =
-            cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(parsed_request.body, "Reverse"));
+            cJSON_GetStringValue(cJSON_GetObjectItem(parsed_request.body, "Reverse"));
         if (reverse && (strcasecmp(reverse, "true") == 0 || strcasecmp(reverse, "false") == 0))
         {
-            bool reverse_value = strcasecmp(reverse, "true") == 0;
-            check_return(rotator->put_reverse(reverse_value), root);
+            if (rotator_require_connected(rotator, root))
+            {
+                bool reverse_value = strcasecmp(reverse, "true") == 0;
+                check_return(rotator->put_reverse(reverse_value), root);
+            }
         }
         else
         {
@@ -3667,10 +3712,13 @@ esp_err_t Api::handle_get_rotator_stepsize(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        double stepsize = 0;
-        if (check_return(rotator->get_stepsize(&stepsize), root))
+        if (rotator_require_connected(rotator, root))
         {
-            cJSON_AddNumberToObject(root, "Value", stepsize);
+            double stepsize = 0;
+            if (check_return(rotator->get_stepsize(&stepsize), root))
+            {
+                cJSON_AddNumberToObject(root, "Value", stepsize);
+            }
         }
     }
     else
@@ -3698,10 +3746,13 @@ esp_err_t Api::handle_get_rotator_targetposition(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        double targetposition = 0;
-        if (check_return(rotator->get_targetposition(&targetposition), root))
+        if (rotator_require_connected(rotator, root))
         {
-            cJSON_AddNumberToObject(root, "Value", targetposition);
+            double targetposition = 0;
+            if (check_return(rotator->get_targetposition(&targetposition), root))
+            {
+                cJSON_AddNumberToObject(root, "Value", targetposition);
+            }
         }
     }
     else
@@ -3729,7 +3780,10 @@ esp_err_t Api::handle_put_rotator_halt(httpd_req_t *req)
     {
         Rotator *rotator = (Rotator *)device;
 
-        check_return(rotator->put_halt(), root);
+        if (rotator_require_connected(rotator, root))
+        {
+            check_return(rotator->put_halt(), root);
+        }
     }
     else
     {
@@ -3757,7 +3811,7 @@ esp_err_t Api::handle_put_rotator_move(httpd_req_t *req)
         Rotator *rotator = (Rotator *)device;
 
         char *position =
-            cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(parsed_request.body, "Position"));
+            cJSON_GetStringValue(cJSON_GetObjectItem(parsed_request.body, "Position"));
         if (position)
         {
             char *endptr;
@@ -3768,7 +3822,10 @@ esp_err_t Api::handle_put_rotator_move(httpd_req_t *req)
                 return api->send_error_response(req, 400);
             }
 
-            check_return(rotator->put_move(position_value), root);
+            if (rotator_require_connected(rotator, root))
+            {
+                check_return(rotator->put_move(position_value), root);
+            }
         }
         else
         {
@@ -3802,7 +3859,7 @@ esp_err_t Api::handle_put_rotator_moveabsolute(httpd_req_t *req)
         Rotator *rotator = (Rotator *)device;
 
         char *position =
-            cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(parsed_request.body, "Position"));
+            cJSON_GetStringValue(cJSON_GetObjectItem(parsed_request.body, "Position"));
         if (position)
         {
             char *endptr;
@@ -3813,7 +3870,11 @@ esp_err_t Api::handle_put_rotator_moveabsolute(httpd_req_t *req)
                 return api->send_error_response(req, 400);
             }
 
-            check_return(rotator->put_moveabsolute(position_value), root);
+            if (rotator_require_connected(rotator, root) &&
+                rotator_require_valid_absolute_position(position_value, root))
+            {
+                check_return(rotator->put_moveabsolute(position_value), root);
+            }
         }
         else
         {
@@ -3847,7 +3908,7 @@ esp_err_t Api::handle_put_rotator_movemechanical(httpd_req_t *req)
         Rotator *rotator = (Rotator *)device;
 
         char *position =
-            cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(parsed_request.body, "Position"));
+            cJSON_GetStringValue(cJSON_GetObjectItem(parsed_request.body, "Position"));
         if (position)
         {
             char *endptr;
@@ -3858,7 +3919,11 @@ esp_err_t Api::handle_put_rotator_movemechanical(httpd_req_t *req)
                 return api->send_error_response(req, 400);
             }
 
-            check_return(rotator->put_movemechanical(position_value), root);
+            if (rotator_require_connected(rotator, root) &&
+                rotator_require_valid_absolute_position(position_value, root))
+            {
+                check_return(rotator->put_movemechanical(position_value), root);
+            }
         }
         else
         {
@@ -3892,7 +3957,7 @@ esp_err_t Api::handle_put_rotator_sync(httpd_req_t *req)
         Rotator *rotator = (Rotator *)device;
 
         char *position =
-            cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(parsed_request.body, "Position"));
+            cJSON_GetStringValue(cJSON_GetObjectItem(parsed_request.body, "Position"));
         if (position)
         {
             char *endptr;
@@ -3903,7 +3968,11 @@ esp_err_t Api::handle_put_rotator_sync(httpd_req_t *req)
                 return api->send_error_response(req, 400);
             }
 
-            check_return(rotator->put_sync(position_value), root);
+            if (rotator_require_connected(rotator, root) &&
+                rotator_require_valid_absolute_position(position_value, root))
+            {
+                check_return(rotator->put_sync(position_value), root);
+            }
         }
         else
         {

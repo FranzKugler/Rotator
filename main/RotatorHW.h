@@ -107,6 +107,10 @@ public:
         return _targetPosition;
     }
     double getMechanicalPosition();
+    // The smallest output-shaft angle this rotator can address (one
+    // microstep, at the driver's full 256-microstep resolution) - what
+    // Alpaca's Rotator.StepSize reports.
+    double getStepSizeDegrees();
     void gotoMechanicalZero();
     int measureMechanicalZero(std::function<void(int)> onProgress);
     // Updates _zeroPosSensorValue (the corrected-sensor-value target at true
