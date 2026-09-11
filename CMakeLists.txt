@@ -2,8 +2,17 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
-# Stamp tagged builds with the same git-describe scheme as QlockThreeW32.
-# The fallback in main/Version.h is used before the first release tag.
+# ESP-IDF's own embedded app-description version (PROJECT_VER - shown by
+# `idf.py monitor`/esptool, baked into the esp_app_desc_t at CMake-configure
+# time). This is NOT what the firmware reports over HTTP/Alpaca - that
+# ROTATOR_VERSION macro is stamped fresh on every single build instead, by
+# scripts/version.py via a custom target in main/CMakeLists.txt (see that
+# file and main/Version.h). The problem with computing it only here, as this
+# project used to: CMake only re-runs this block when it reconfigures, which
+# a plain `idf.py build` after committing or tagging does not do - the
+# version then quietly goes stale until something forces a reconfigure.
+# PROJECT_VER has no build-time equivalent hook in ESP-IDF, so it keeps this
+# configure-time-only, best-effort computation.
 if(DEFINED ENV{ROTATOR_BUILD_VERSION_OVERRIDE} AND NOT "$ENV{ROTATOR_BUILD_VERSION_OVERRIDE}" STREQUAL "")
     set(ROTATOR_BUILD_VERSION "$ENV{ROTATOR_BUILD_VERSION_OVERRIDE}")
 else()
@@ -21,10 +30,8 @@ if(NOT ROTATOR_BUILD_VERSION AND ROTATOR_GIT_RESULT EQUAL 0 AND ROTATOR_GIT_VERS
 elseif(NOT ROTATOR_BUILD_VERSION)
     set(ROTATOR_BUILD_VERSION "0.8.0")
 endif()
-add_compile_definitions(ROTATOR_VERSION="${ROTATOR_BUILD_VERSION}")
 set(PROJECT_VER "${ROTATOR_BUILD_VERSION}")
-file(WRITE "${CMAKE_BINARY_DIR}/version.txt" "${ROTATOR_BUILD_VERSION}\n")
-message(STATUS "Rotator version: ${ROTATOR_BUILD_VERSION}")
+message(STATUS "Rotator PROJECT_VER (app descriptor, configure-time only): ${ROTATOR_BUILD_VERSION}")
 
 # make sure we get the tinyusb headers with higher priority than the ones coming from Arduino
 include_directories(BEFORE
