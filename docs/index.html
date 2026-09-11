@@ -71,11 +71,20 @@
     margin: 0 auto;
   }
   .mark {
-    display: block;
-    width: 4.5rem;
-    height: 4.5rem;
+    width: 100%;
+    aspect-ratio: 1;
     margin: 1.6rem auto 0;
     border-radius: 22%;
+    overflow: hidden;
+    background: var(--accent);
+    isolation: isolate;
+  }
+  .mark img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    mix-blend-mode: screen;
   }
 
   section {
@@ -212,7 +221,7 @@
       whole flash: bootloader, partition table, firmware and browser
       interface, in one go.
     </p>
-    <img class="mark" src="AstroGeeksLogo.png" width="64" height="64" alt="AstroGeeks">
+    <div class="mark"><img src="AstroGeeksLogo.png" alt="AstroGeeks"></div>
   </header>
 
   <section>
