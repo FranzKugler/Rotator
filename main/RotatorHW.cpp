@@ -131,6 +131,23 @@ const uint32_t NORMAL_MOTOR_SPEED = STEPS_PER_ROTATION / 10;
 // opposite directions from one starting point cover a full revolution with
 // margin, and the sector must lie within it, since normal operation never
 // lets a completed move end up further than this from zero either.
+// Gear backlash sits downstream of the AS5600, which is on the motor shaft,
+// so no amount of closed-loop control can see it: the sensor reaches the
+// commanded angle either way while the output shaft rests on whichever side
+// of the backlash the last motion left it on. Measured live on 2026-09-19
+// over 200 random Alpaca targets against an output-shaft camera, that split
+// the output by 64 mdeg peak to peak - larger than every other correctable
+// error on this machine put together, and five times what the sensor
+// calibration itself achieves (see scripts/calib/RESULTS.md).
+//
+// The cure costs nothing but a little travel: make the last motion always go
+// the same way. Every approach below therefore ends moving in the positive
+// direction, backing off to (target - BACKLASH_APPROACH_DEG) first whenever
+// a correction would otherwise be negative. The margin is a little over
+// twice the measured backlash, so a single back-off always re-takes it up,
+// and it is small enough to cost well under a second of extra travel.
+constexpr double BACKLASH_APPROACH_DEG = 0.15;
+
 const double MOTION_LIMIT_DEG = 190.0;
 const long MOTION_LIMIT_STEPS = (long)(MOTION_LIMIT_DEG / DEGREE_PER_STEP);
 
@@ -1026,6 +1043,11 @@ void RotatorHW::refineToTarget(long targetMotorSteps)
     constexpr int maxIterations = 20;
     constexpr int sensorSamples = 8;
     constexpr double periodDeg = 36.0; // one AS5600 revolution = 360/10 output degrees
+    // A back-off costs two corrections, so an unlucky run could otherwise
+    // spend the whole iteration budget ping-ponging. In practice one is
+    // enough: from BACKLASH_APPROACH_DEG below target, kP = 0.9 lands inside
+    // tolerance in two corrections without crossing it.
+    constexpr int maxBackOffs = 3;
 
     double targetOutputDeg = (double)targetMotorSteps * DEGREE_PER_STEP;
 
@@ -1049,6 +1071,39 @@ void RotatorHW::refineToTarget(long targetMotorSteps)
 
     double integral = 0.0;
     int iterationsUsed = 0;
+    int backOffs = 0;
+
+    // Move by `deg`, then re-seed the estimate from a fresh measurement
+    // rather than predicting it. Used for the backlash back-offs, which are
+    // far too large a jump to keep the filter's accumulated confidence
+    // through - predicting across one would leave kf.P claiming an accuracy
+    // the estimate no longer has.
+    auto reseedAfterMove = [&](double deg)
+    {
+        int32_t microsteps = (int32_t)std::lround(deg / DEGREE_PER_STEP);
+        if (microsteps == 0)
+            return;
+        MOVE_WAIT(microsteps);
+        vTaskDelay(150 / portTICK_PERIOD_MS);
+        double counts = correctSensorReading(MEASURE_PRECISE_ANGLE_DOUBLE(sensorSamples));
+        double wrapped = FMOD4096(counts) * periodDeg / 4096.0;
+        double offset = wrapped - targetOutputDeg;
+        offset -= periodDeg * std::round(offset / periodDeg);
+        kf.x = targetOutputDeg + offset;
+        kf.P = 1e-4;
+        integral = 0.0;
+    };
+
+    // Start below the target so that every correction from here is positive
+    // and the gearbox is only ever loaded one way. Skipped when the
+    // open-loop move already landed short, which is the common case.
+    if (kf.x > targetOutputDeg - toleranceDeg)
+    {
+        ESP_LOGI(TAG, "refineToTarget: backing off %.3f deg below target for a one-sided approach",
+                 BACKLASH_APPROACH_DEG);
+        reseedAfterMove((targetOutputDeg - BACKLASH_APPROACH_DEG) - kf.x);
+        backOffs++;
+    }
 
     for (int iter = 0; iter < maxIterations; ++iter)
     {
@@ -1057,12 +1112,30 @@ void RotatorHW::refineToTarget(long targetMotorSteps)
             break;
         iterationsUsed = iter + 1;
 
-        if (std::fabs(error) < integralBandDeg)
+        // Overshot. Correcting downwards would hand the output shaft back to
+        // the other side of the backlash and undo the one-sided approach, so
+        // back off past the target instead and come at it from below again.
+        if (error < 0.0)
+        {
+            if (backOffs >= maxBackOffs)
+            {
+                ESP_LOGW(TAG, "refineToTarget: overshot by %.4f deg with no back-offs left, "
+                              "stopping on the wrong side of the backlash", -error);
+                break;
+            }
+            ESP_LOGI(TAG, "refineToTarget iter %d: overshot by %.4f deg, re-approaching from below",
+                     iter + 1, -error);
+            reseedAfterMove((targetOutputDeg - BACKLASH_APPROACH_DEG) - kf.x);
+            backOffs++;
+            continue;
+        }
+
+        if (error < integralBandDeg)
             integral += error;
         double controlDeg = kP * error + kI * integral;
         int32_t controlMicrosteps = (int32_t)std::lround(controlDeg / DEGREE_PER_STEP);
-        if (controlMicrosteps == 0)
-            controlMicrosteps = (controlDeg > 0.0) ? 1 : -1;
+        if (controlMicrosteps <= 0)
+            controlMicrosteps = 1;
 
         MOVE_WAIT(controlMicrosteps);
         vTaskDelay(150 / portTICK_PERIOD_MS);
@@ -1081,8 +1154,8 @@ void RotatorHW::refineToTarget(long targetMotorSteps)
                  iter + 1, (long)controlMicrosteps, commandedDeg, measuredDeg, kf.x, targetOutputDeg - kf.x);
     }
 
-    ESP_LOGI(TAG, "refineToTarget done after %d correction(s): estimate=%.4f deg (target %.4f, error %.4f deg)",
-             iterationsUsed, kf.x, targetOutputDeg, targetOutputDeg - kf.x);
+    ESP_LOGI(TAG, "refineToTarget done after %d correction(s) and %d back-off(s): estimate=%.4f deg (target %.4f, error %.4f deg)",
+             iterationsUsed, backOffs, kf.x, targetOutputDeg, targetOutputDeg - kf.x);
 }
 
 // Continuous counterpart to refineToTarget(): the same control law (an
@@ -1189,9 +1262,28 @@ void RotatorHW::holdTask(void *arg)
         }
 
         double error = targetOutputDeg - kf.x;
-        if (std::fabs(error) < integralBandDeg)
+
+        // The same one-sided rule refineToTarget() establishes, kept up for
+        // as long as the hold lasts - otherwise the first downward
+        // correction here quietly undoes it.
+        //
+        // A downward correction does not move the output shaft: backlash is
+        // downstream of the sensor, so all it does is hand the gear train
+        // back across the slack that the approach deliberately took up, and
+        // the next upward correction has to take it up again. Inside the
+        // margin the right amount of motor motion is therefore none at all,
+        // and the integral has to be frozen with it - left running it would
+        // wind up for as long as the hold lasts against a correction that is
+        // never made, and then fire all of it at once.
+        //
+        // Past the margin it is no longer slack but real drift, and that is
+        // worth the excursion: go below the target and come back up. Sized
+        // by BACKLASH_APPROACH_DEG, so an ordinary hold never sees it.
+        bool holdingAgainstBacklash = (error < 0.0) && (-error < BACKLASH_APPROACH_DEG);
+
+        if (!holdingAgainstBacklash && std::fabs(error) < integralBandDeg)
             integral += error;
-        double controlDeg = kP * error + kI * integral;
+        double controlDeg = holdingAgainstBacklash ? 0.0 : (kP * error + kI * integral);
 
         // The PI state above (integral, and kf below) updates every cycle,
         // unconditionally - that is what makes this a continuously-running
@@ -1212,6 +1304,19 @@ void RotatorHW::holdTask(void *arg)
         int32_t controlMicrosteps = (std::fabs(controlDeg) >= toleranceDeg)
                                          ? (int32_t)std::lround(controlDeg / DEGREE_PER_STEP)
                                          : 0;
+
+        // Drifted past the target by more than the backlash: replace the
+        // downward correction with a move to below it, so the cycles that
+        // follow come back up and leave the gear train loaded the same way
+        // every commanded move does.
+        if (controlMicrosteps < 0)
+        {
+            controlMicrosteps = (int32_t)std::lround(
+                ((targetOutputDeg - BACKLASH_APPROACH_DEG) - kf.x) / DEGREE_PER_STEP);
+            integral = 0.0;
+            kf.P = 1e-4; // a jump this size invalidates the filter's accumulated confidence
+            ESP_LOGI(TAG, "hold: drifted %.4f deg past target, re-approaching from below", -error);
+        }
 
         if (controlMicrosteps != 0)
         {
