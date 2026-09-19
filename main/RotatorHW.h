@@ -212,6 +212,14 @@ private:
     // minutes after every boot before this existed.
     uint16_t readAngleSafe();
 
+    // Last reading that came back without an I2C error - readAngleSafe()
+    // returns this instead of the 0 the driver reports on a bus failure.
+    // Written and read under i2cMutex, like the sensor access it shadows.
+    // Nothing seeds it before the first read, so a bus failure on the very
+    // first call still yields 0 - unchanged from AS5600::readAngle(), whose
+    // own _lastReadAngle starts at 0 for exactly the same reason.
+    uint16_t _lastGoodAngle = 0;
+
     // Runs for the process lifetime once begin() starts it, at a fixed
     // 150ms cadence (matching refineToTarget()'s own iteration period):
     // while _holdActive is set (after a commanded move/homing settles - see

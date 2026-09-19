@@ -267,9 +267,34 @@ void RotatorHW::begin()
  */
 uint16_t RotatorHW::readAngleSafe()
 {
+    // RAW ANGLE (0x0C), deliberately not ANGLE (0x0E). The AS5600 applies a
+    // ~10 LSB hysteresis to the ANGLE register at the limit of its 360
+    // degree range, by design, to keep the output from toggling there. On
+    // this rotator that put a dead band across the sensor's wrap: measured
+    // live on 2026-09-18 with a one-count fine sweep, travelling upwards the
+    // ANGLE output stuck at exactly 4095 for 275 microsteps - eleven counts
+    // of real motion reported as no motion at all - and then jumped straight
+    // to 11, while the same crossing downwards was smooth. That is roughly
+    // 0.105 output degrees per motor revolution in which the sensor carried
+    // no position information, ten times the accuracy this machine is aimed
+    // at, and no smooth correction model can represent it. RAW ANGLE is the
+    // unprocessed 12-bit measurement and has no such hysteresis.
+    //
+    // AS5600::rawAngle(), unlike AS5600::readAngle(), does not check for an
+    // I2C failure, and AS5600::readReg2() returns 0 on one - so a bus
+    // hiccup would be indistinguishable from a real reading at the sensor's
+    // zero. The last good value is held here instead, which is what
+    // readAngle() does internally and what the callers have always assumed.
     xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    uint16_t value = as5600.readAngle();
+    uint16_t value = as5600.rawAngle();
+    int error = as5600.lastError();
+    bool ok = (error == AS5600_OK);
+    if (ok) _lastGoodAngle = value;
+    else value = _lastGoodAngle;
     xSemaphoreGive(i2cMutex);
+
+    if (!ok)
+        ESP_LOGW(TAG, "AS5600 read failed (%d), holding last angle %u", error, value);
     return value;
 }
 
