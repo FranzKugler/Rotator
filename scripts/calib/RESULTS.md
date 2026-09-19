@@ -260,6 +260,67 @@ the camera rig and one of the rotator rig look identical, and two hours of
 motor running warms both. Either way, a calibration run should be short, and
 a correction should not be assumed good for a whole night without checking.
 
+## The routine now runs on the device
+
+The host-driven sweep above is what `calibrateAngleSensor()` does as of
+v0.10.0, in-process and camera-free, reachable at
+`GET /api/calibration/angle/stream`. Three things changed against the old
+one, all of them measured rather than reasoned:
+
+- it never touches the driver's microstep resolution. The old routine
+  switched to full-step mode, which leaves FastAccelStepper's position
+  counter undercounting by up to 256x - forcing a re-home afterwards - and
+  is the prime suspect for the hangs that killed four of four live attempts;
+- it settles 250 ms and averages 16 samples, where the old one settled 20 ms.
+  That is almost certainly why moving at the normal resolution had been
+  judged "measurably worse" once before: 20 ms is far too short for a
+  256-microstep move to stop ringing;
+- the fit is least squares against the **absolute step counter**, not a 2/N
+  Fourier projection against the sweep's own first point. The old anchor is
+  what made every recalibration silently move the mechanical zero.
+
+Run on the device, against the same machine the host campaign measured:
+
+| | host campaign | in firmware |
+|---|---|---|
+| residual | 0.347 counts (3.05 mdeg) | **0.415 counts (3.65 mdeg)** |
+| closure over a revolution | <= 0.5 counts | -0.875 counts |
+| A1..A5 | -4.04 -4.69 -0.70 0.70 0.15 | -4.30 -4.58 -0.68 0.74 0.21 |
+| B1..B5 | -7.57 0.80 1.13 3.20 0.58 | -7.52 0.78 0.96 3.23 0.60 |
+
+Every harmonic agrees to within a few percent, and the "before" figure the
+run reported - 0.660 counts for the migrated order-4 correction - is what
+order 4 measured on the bench.
+
+## Three stored things that have to agree
+
+The coefficients, the mechanical-zero target and the full-step table are not
+independent: the zero is stored as a *corrected* sensor value and the table
+is indexed by one, so both are expressed in terms of whatever correction was
+in force when they were measured. Replacing the coefficients does not make
+them noisily wrong, it makes them silently wrong - which is how a table
+spanning 353 mdeg came to be sitting on this device against a correction it
+no longer belonged to.
+
+Every write of the coefficients now bumps a generation, the two derived
+artefacts are stamped with the generation they were measured against, and a
+mismatch is reported at load. `GET /api/calibration/status` answers it:
+
+```json
+{"generation":3,"kmax":5,"zeroStale":false,
+ "fullStepTableStale":false,"zeroPosSensorValue":780,"consistent":true}
+```
+
+A stale table is dropped rather than applied - all-zero is a no-op, a
+mismatched one is a confident wrong answer - while a stale zero is reported
+but still used, since dropping it would leave homing with nothing.
+
+Running this on the device turned up one more thing. Its stored mechanical
+zero was **27**, the hand-measured constant that predates any calibration,
+and it had never been re-derived. Measured properly it is **780** - so the
+machine's absolute zero moves by 6.6 degrees, and every Alpaca position it
+reported before this was offset by that much.
+
 ## Answering the original question
 
 A user with a fresh unit, calibrating without a camera, can correct the

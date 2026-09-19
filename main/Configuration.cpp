@@ -7,16 +7,48 @@ namespace {
 constexpr const char *ANGLECAL_NVS_NAMESPACE = "anglecal";
 constexpr const char *ANGLECAL_NVS_KEY = "coeffs";
 constexpr const char *FULLSTEP_TABLE_NVS_KEY = "fullsteptable";
+constexpr const char *FULLSTEP_GEN_NVS_KEY = "fullstepgen";
 
-// Raw NVS blob layout for the Fourier coefficients - fixed size, so a future
-// change to KMAX must be treated like any other persistent-format change
-// (see loadAngleCalFromNvs()'s size check, which just falls back to defaults
-// rather than misreading a differently-shaped blob).
+// Everything the angle correction persists carries a generation number, and
+// the two artefacts derived from it carry the generation they were made
+// with. That is the whole point of the header below.
+//
+// The three stored pieces - the Fourier coefficients, the mechanical-zero
+// target and the full-step residual table - are not independent. The zero is
+// stored as a *corrected* sensor value and the table is indexed by one, so
+// both are expressed in terms of whatever correction was in force when they
+// were measured. Replace the coefficients and they do not become wrong
+// noisily; they become wrong silently. Live on 2026-09-19 the stored table
+// was found spanning 353 mdeg peak to peak against a correction it no longer
+// belonged to, injecting up to 222 mdeg of drift with nothing anywhere
+// saying so.
+//
+// So: writing coefficients that differ from the stored ones bumps
+// `generation`, and the table and the zero record the generation they were
+// stamped with. A mismatch at load is reported, and the table - whose
+// all-zero state is a harmless no-op - is dropped rather than applied.
+constexpr uint32_t ANGLECAL_MAGIC = 0x41434C31;   // "ACL1"
+constexpr uint16_t ANGLECAL_VERSION = 1;
+
 struct AngleCalBlob
 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kmax;       // so a KMAX change is detected and migrated, not misread
+    uint32_t generation;
     double C0;
     double A[KMAX + 1];
     double B[KMAX + 1];
+};
+
+// The layout before the header existed, when KMAX was 4. Recognised by size
+// alone, which is all it offers, and migrated rather than discarded: the
+// harmonics it holds are still valid, the new top one is simply zero.
+struct LegacyAngleCalBlob
+{
+    double C0;
+    double A[5];
+    double B[5];
 };
 } // namespace
 
@@ -52,6 +84,16 @@ Configuration::Configuration()
     {
         ESP_LOGW("cfg", "Config load failed — writing defaults");
         save();
+    }
+    else if (_migratedAngleCal)
+    {
+        // Write the migrated calibration back in the current format, so the
+        // migration happens once rather than on every boot and the
+        // generation stops moving under the artefacts stamped against it.
+        // Coefficients only. The table keeps whatever stamp it had, so a
+        // pre-migration one stays visibly orphaned instead of being adopted.
+        saveAngleCalToNvs();
+        _migratedAngleCal = false;
     }
 }
 
@@ -162,19 +204,69 @@ bool Configuration::loadAngleCalFromNvs()
     nvs_handle_t nvs;
     if (nvs_open(ANGLECAL_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK)
         return false;
-    AngleCalBlob blob;
-    size_t size = sizeof(blob);
-    esp_err_t err = nvs_get_blob(nvs, ANGLECAL_NVS_KEY, &blob, &size);
-    nvs_close(nvs);
-    if (err != ESP_OK || size != sizeof(blob))
-        return false;
-    _data.C0 = blob.C0;
-    for (int i = 0; i <= KMAX; ++i)
+
+    size_t size = 0;
+    esp_err_t err = nvs_get_blob(nvs, ANGLECAL_NVS_KEY, nullptr, &size);
+    if (err != ESP_OK)
     {
-        _data.A[i] = blob.A[i];
-        _data.B[i] = blob.B[i];
+        nvs_close(nvs);
+        return false;
     }
-    return true;
+
+    if (size == sizeof(AngleCalBlob))
+    {
+        AngleCalBlob blob;
+        size_t got = sizeof(blob);
+        err = nvs_get_blob(nvs, ANGLECAL_NVS_KEY, &blob, &got);
+        nvs_close(nvs);
+        if (err != ESP_OK || blob.magic != ANGLECAL_MAGIC ||
+            blob.version != ANGLECAL_VERSION || blob.kmax != KMAX)
+        {
+            ESP_LOGW("cfg", "Stored angle calibration is not this format "
+                            "(magic %08lx version %u kmax %u) - using defaults",
+                     (unsigned long)blob.magic, blob.version, blob.kmax);
+            return false;
+        }
+        _data.C0 = blob.C0;
+        for (int i = 0; i <= KMAX; ++i)
+        {
+            _data.A[i] = blob.A[i];
+            _data.B[i] = blob.B[i];
+        }
+        _generation = blob.generation;
+        return true;
+    }
+
+    if (size == sizeof(LegacyAngleCalBlob) && KMAX >= 4)
+    {
+        LegacyAngleCalBlob legacy;
+        size_t got = sizeof(legacy);
+        err = nvs_get_blob(nvs, ANGLECAL_NVS_KEY, &legacy, &got);
+        nvs_close(nvs);
+        if (err != ESP_OK)
+            return false;
+        _data.C0 = legacy.C0;
+        for (int i = 0; i <= KMAX; ++i)
+        {
+            _data.A[i] = (i < 5) ? legacy.A[i] : 0.0;
+            _data.B[i] = (i < 5) ? legacy.B[i] : 0.0;
+        }
+        // A migrated calibration keeps its coefficients but gets a fresh
+        // generation, because nothing recorded which zero and table went
+        // with it - so they are treated as not belonging to it, which is the
+        // safe reading rather than the convenient one.
+        _generation = 1;
+        _migratedAngleCal = true;
+        ESP_LOGW("cfg", "Migrated a pre-header angle calibration (KMAX 4 -> %d); "
+                        "the stored mechanical zero and full-step table are now "
+                        "marked as not belonging to it", KMAX);
+        return true;
+    }
+
+    nvs_close(nvs);
+    ESP_LOGW("cfg", "Stored angle calibration has an unexpected size (%u bytes) - using defaults",
+             (unsigned)size);
+    return false;
 }
 
 bool Configuration::saveAngleCalToNvs() const
@@ -185,13 +277,35 @@ bool Configuration::saveAngleCalToNvs() const
         ESP_LOGE("cfg", "Could not open NVS namespace '%s' to persist angle calibration", ANGLECAL_NVS_NAMESPACE);
         return false;
     }
+    // Only a real change to the coefficients bumps the generation. save() is
+    // called for unrelated reasons (a network setting, a direction flag), and
+    // bumping on those would invalidate a perfectly good zero and table every
+    // time someone changed an IP address.
+    AngleCalBlob previous;
+    size_t previousSize = sizeof(previous);
+    bool havePrevious = nvs_get_blob(nvs, ANGLECAL_NVS_KEY, &previous, &previousSize) == ESP_OK &&
+                        previousSize == sizeof(previous) && previous.magic == ANGLECAL_MAGIC;
+    bool changed = !havePrevious || previous.C0 != _data.C0;
+    for (int i = 0; !changed && i <= KMAX; ++i)
+        changed = previous.A[i] != _data.A[i] || previous.B[i] != _data.B[i];
+
     AngleCalBlob blob;
+    blob.magic = ANGLECAL_MAGIC;
+    blob.version = ANGLECAL_VERSION;
+    blob.kmax = KMAX;
+    blob.generation = changed ? (havePrevious ? previous.generation : _generation) + 1
+                              : previous.generation;
     blob.C0 = _data.C0;
     for (int i = 0; i <= KMAX; ++i)
     {
         blob.A[i] = _data.A[i];
         blob.B[i] = _data.B[i];
     }
+    if (changed)
+        ESP_LOGI("cfg", "Angle calibration changed - generation %lu; the mechanical zero "
+                        "and full-step table no longer belong to it until re-measured",
+                 (unsigned long)blob.generation);
+    const_cast<Configuration *>(this)->_generation = blob.generation;
     esp_err_t err = nvs_set_blob(nvs, ANGLECAL_NVS_KEY, &blob, sizeof(blob));
     if (err == ESP_OK)
         err = nvs_commit(nvs);
@@ -212,9 +326,49 @@ bool Configuration::loadFullStepTableFromNvs()
     std::array<float, N_STEPS> table;
     size_t size = table.size() * sizeof(float);
     esp_err_t err = nvs_get_blob(nvs, FULLSTEP_TABLE_NVS_KEY, table.data(), &size);
+    uint32_t stamped = 0;
+    if (nvs_get_u32(nvs, FULLSTEP_GEN_NVS_KEY, &stamped) != ESP_OK)
+        stamped = 0;
     nvs_close(nvs);
     if (err != ESP_OK || size != table.size() * sizeof(float))
         return false;
+
+    // The table is indexed by the corrected sensor value, so it only means
+    // anything alongside the correction it was fitted against. Applying a
+    // stale one is worse than applying none: all-zero is a no-op, a
+    // mismatched one is a confident wrong answer.
+    bool allZero = true;
+    for (float v : table)
+        if (v != 0.0f) { allZero = false; break; }
+
+    // An all-zero table is a no-op correction and therefore belongs to every
+    // calibration - reporting it as orphaned would be a false alarm that
+    // never clears.
+    if (allZero)
+    {
+        _fullStepTableStale = false;
+        _fullStepTableGen = _generation;
+        _data.fullStepTable = table;
+        return true;
+    }
+
+    if (stamped != _generation)
+    {
+        _fullStepTableStale = true;
+        _data.fullStepTable.fill(0.0f);
+        // An all-zero table is a no-op correction, so it is valid against any
+        // calibration - it adopts the current generation rather than staying
+        // permanently mismatched. The drop itself is reported for this boot
+        // and logged once, which is the part that matters.
+        _fullStepTableGen = _generation;
+        ESP_LOGW("cfg", "Full-step table was fitted against calibration generation %lu "
+                        "but the stored correction is generation %lu - dropped. "
+                        "Re-measure it against the current correction.",
+                 (unsigned long)stamped, (unsigned long)_generation);
+        return true;
+    }
+    _fullStepTableStale = false;
+    _fullStepTableGen = stamped;
     _data.fullStepTable = table;
     return true;
 }
@@ -229,6 +383,12 @@ bool Configuration::saveFullStepTableToNvs() const
     }
     esp_err_t err = nvs_set_blob(nvs, FULLSTEP_TABLE_NVS_KEY, _data.fullStepTable.data(),
                                   _data.fullStepTable.size() * sizeof(float));
+    // The stamp the table actually carries - NOT today's generation. save()
+    // is called for unrelated reasons, and writing the current generation
+    // here would quietly re-validate a table that nobody re-measured, which
+    // is the exact failure this whole mechanism exists to catch.
+    if (err == ESP_OK)
+        err = nvs_set_u32(nvs, FULLSTEP_GEN_NVS_KEY, _fullStepTableGen);
     if (err == ESP_OK)
         err = nvs_commit(nvs);
     nvs_close(nvs);
@@ -403,6 +563,9 @@ void Configuration::getFullStepTable(float outTable[N_STEPS]) const
 }
 void Configuration::setFullStepTable(const float table[N_STEPS])
 {
+    // Whoever writes a table has just fitted it against the correction in
+    // force, so it belongs to that generation from here on.
+    _fullStepTableGen = _generation;
     {
         std::lock_guard<std::mutex> l(_mtx);
         for (int i = 0; i < N_STEPS; ++i)

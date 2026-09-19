@@ -118,6 +118,12 @@ const short unsigned int SENSORCOUNT_STEPS_PER_ROTATION = 4096;
 const short unsigned int STEPS_PER_SENSORCOUNT = (MICROSTEPS * FULLSTEPS_PER_ROTATION) / SENSORCOUNT_STEPS_PER_ROTATION;
 const long unsigned int STEPS_PER_ROTATION = FULLSTEPS_PER_ROTATION * 10 * MICROSTEPS;
 const double DEGREE_PER_STEP = 360.0 / FULLSTEPS_PER_ROTATION / 10 / MICROSTEPS;
+// AS5600 counts per commanded microstep - exactly 1/25 here. This is the
+// absolute reference the sensor calibration fits against: the step counter
+// knows where the machine is relative to its own mechanical zero, so a
+// correction anchored to it is a property of the machine rather than of
+// wherever a calibration sweep happened to begin.
+const double COUNTS_PER_MICROSTEP = 4096.0 / (double)(FULLSTEPS_PER_ROTATION * MICROSTEPS);
 const uint32_t NORMAL_MOTOR_SPEED = STEPS_PER_ROTATION / 10;
 // const long unsigned int EDGE_STEPS = 256 * 256;
 
@@ -197,6 +203,23 @@ RotatorHW::RotatorHW()
             int32_t stored = 0;
             if (nvs_get_i32(nvs, "zeroSensor", &stored) == ESP_OK)
                 _zeroPosSensorValue = (int16_t)stored;
+            // The zero target is a *corrected* sensor value, so it only
+            // means anything alongside the correction it was measured
+            // against - see Configuration.cpp's AngleCalBlob comment. A
+            // mismatch is reported rather than acted on: unlike the
+            // full-step table, dropping the zero would leave homing with
+            // nothing at all, so the stored value is still used and the
+            // staleness is surfaced instead (getCalibrationStatus(),
+            // /api/calibration/status).
+            uint32_t stamped = 0;
+            if (nvs_get_u32(nvs, "zeroGen", &stamped) != ESP_OK)
+                stamped = 0;
+            _zeroCalibrationStale = (stamped != cfg.calibrationGeneration());
+            if (_zeroCalibrationStale)
+                ESP_LOGW(TAG, "Mechanical zero was measured against calibration generation %lu "
+                              "but the stored correction is generation %lu - absolute positions "
+                              "may be offset until the zero is re-measured",
+                         (unsigned long)stamped, (unsigned long)cfg.calibrationGeneration());
             nvs_close(nvs);
         }
     }
@@ -585,6 +608,13 @@ int RotatorHW::measureMechanicalZero(std::function<void(int)> onProgress)
     return sensorMechanicalZeroPosition;
 }
 
+RotatorHW::CalibrationStatus RotatorHW::getCalibrationStatus() const
+{
+    auto &cfg = Configuration::getInstance();
+    return {cfg.calibrationGeneration(), KMAX, _zeroCalibrationStale,
+            cfg.fullStepTableStale(), _zeroPosSensorValue};
+}
+
 void RotatorHW::setZeroPosSensorValue(int value)
 {
     _zeroPosSensorValue = (int16_t)value;
@@ -595,12 +625,20 @@ void RotatorHW::setZeroPosSensorValue(int value)
         return;
     }
     esp_err_t err = nvs_set_i32(nvs, "zeroSensor", value);
+    // Stamped with the correction this zero was measured against, so a later
+    // coefficient change can be seen to have orphaned it.
+    if (err == ESP_OK)
+        err = nvs_set_u32(nvs, "zeroGen", Configuration::getInstance().calibrationGeneration());
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "Could not persist zeroPosSensorValue=%d to NVS: %s", value, esp_err_to_name(err));
-    else
-        ESP_LOGI(TAG, "Persisted zeroPosSensorValue=%d to NVS", value);
+        return;
+    }
+    _zeroCalibrationStale = false;
+    ESP_LOGI(TAG, "Persisted zeroPosSensorValue=%d to NVS (calibration generation %lu)",
+             value, (unsigned long)Configuration::getInstance().calibrationGeneration());
 }
 
 void RotatorHW::findEdge(bool dirCW)
@@ -702,102 +740,155 @@ int32_t RotatorHW::stressFullStepI2C(int32_t steps, int sampleCount, std::functi
 //void RotatorHW::calibrateAngleSensor(void)
 RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(int)> onProgress)
 {
-    // Sweep this many full motor revolutions and average the (wrapped) error
-    // at each step index before fitting. This trades calibration time for
-    // less read/motor noise in the fit; bump it if the reported residual
-    // still looks noisy. Confirmed clean on the bench at 2 repeats (residual
-    // RMS ~1 degree, consistent across two separate runs) with the full-step
-    // motion below.
+    // Sweep the motor one full revolution per repeat, one full step at a
+    // time, reading the AS5600 at each, and fit the sensor's error against
+    // the step counter. This is the procedure that was validated on the
+    // bench on 2026-09-18/19 (scripts/calib/, RESULTS.md) - run from the
+    // host over /api/debug/jog there, the same thing in-process here.
     //
-    // Two other approaches were tried live and rejected - not because of
-    // CAL_REPEATS, but because both replaced the full-step motion itself:
-    // a variant that switched the driver to full-step mode as below but then
-    // tried to rescale FastAccelStepper's position counter afterwards via one
-    // large setCurrentPosition() jump corrupted that counter outright (its
-    // internal 16-bit position reconstruction does not tolerate a jump that
-    // size); a variant that avoided the rescale by moving MICROSTEPS pulses
-    // at the normal driver resolution instead of switching to full-step mode
-    // measured a materially worse fit even at a single repeat. Both are
-    // symptoms of a deeper, still-unresolved cross-task reliability issue
-    // between FastAccelStepper's move()/isRunning() and the 100 ms
-    // angle_producer_task reading the same object - not something to keep
-    // patching blind. The known, accepted cost of leaving that alone: this
-    // full-step sweep runs the driver at a different microstep resolution
-    // than FastAccelStepper's position counter assumes, so the counter
-    // undercounts by up to 256x for the duration of the sweep and is left
-    // that way afterwards - gotoMechanicalZero() must be re-run after any
-    // calibration before trusting absolute position commands, which is
-    // already required anyway (recalibrating shifts the sensor correction's
-    // C0 offset, invalidating the stored mechanical-zero reference).
+    // Three deliberate differences from what this routine used to do, all of
+    // them measured rather than reasoned:
+    //
+    // 1. It never touches the driver's microstep resolution. Switching to
+    //    full-step mode and using forwardStep() leaves FastAccelStepper's
+    //    position counter undercounting by up to 256x - which is why a
+    //    re-home used to be mandatory afterwards - and it is the prime
+    //    suspect for the hangs that killed four of four live attempts.
+    //    Moving MICROSTEPS pulses at the normal resolution had been tried
+    //    once before and judged worse, but that attempt kept a 20 ms settle,
+    //    far too short for a 256-microstep move to stop ringing.
+    // 2. It settles properly and averages more: SETTLE_MS between the move
+    //    and the reading, and the reading itself averaged over SAMPLES. With
+    //    the RAW ANGLE register's +/-1 LSB dither (see readAngleSafe()) that
+    //    averaging buys real sub-count resolution, which the filtered ANGLE
+    //    register never allowed.
+    // 3. The fit is anchored to the absolute step counter, not to the
+    //    sweep's own first point. The mechanical-zero target is stored as a
+    //    *corrected* sensor value, so the constant term decides where the
+    //    machine thinks zero is; anchoring it to the sweep made every
+    //    recalibration silently move that zero.
+    //
+    // What it measured, live: closure within 0.5 counts over a revolution,
+    // forward repeatability 0.149 counts, residual 0.347 counts - 3.0 mdeg
+    // of output angle - reproduced across two independent sweeps agreeing to
+    // a few percent on every harmonic, and confirmed end to end against an
+    // independent output-shaft camera.
+    //
+    // No full-step alignment first, deliberately: the fit correlates against
+    // the sensor's own reading, so where the support points sit inside a
+    // full step does not enter it, and alignToFullStep() would reintroduce
+    // the microstep-mode switch this routine exists to avoid.
     constexpr int CAL_REPEATS = 2;
+    constexpr int SETTLE_MS = 250;
+    constexpr int SAMPLES = 16;
+    constexpr int RUNUP_FULLSTEPS = 8;
+    constexpr int32_t STEP = MICROSTEPS; // one full step, at normal resolution
 
     MotionLock motionLock(motionMutex);
-    _holdActive = false; // full-step sweep below leaves the reference untrustworthy
+    _holdActive = false; // the sweep walks a whole revolution away from any target
+    _isMoving = true;
 
-    // set driver to fullsteps
-    stepper_driver.setMicrostepsPerStep(1);
+    const int total = CAL_REPEATS * N_STEPS;
+    std::vector<double> raw;
+    std::vector<double> stepPos;
+    raw.reserve(total);
+    stepPos.reserve(total);
 
-    // Accumulate the *wrapped error against the ideal ramp* per step index,
-    // not the raw counts themselves - averaging raw counts directly would
-    // break near the 0/4096 wraparound whenever it falls inside the sweep.
-    std::vector<double> avgErr(N_STEPS, 0.0);
-    for (int r = 0; r < CAL_REPEATS; r++)
+    // Unrecorded run-up, so the motor's magnetic history and any slop are in
+    // the state the recorded points will be measured in rather than folded
+    // into the first few of them.
+    MOVE_WAIT(RUNUP_FULLSTEPS * STEP);
+    vTaskDelay(SETTLE_MS / portTICK_PERIOD_MS);
+
+    for (int i = 0; i < total; i++)
     {
+        vTaskDelay(SETTLE_MS / portTICK_PERIOD_MS);
+        raw.push_back(FMOD4096(MEASURE_PRECISE_ANGLE_DOUBLE(SAMPLES)));
+        stepPos.push_back((double)getStepPositionSafe());
+        onProgress(100 * i / total);
+        MOVE_WAIT(STEP);
+    }
+    _isMoving = false;
+
+    // Unwrap the readings into a continuous ramp so the 4095->0 seam does not
+    // turn into a 4096-count error, then take the error against the absolute
+    // commanded position. The whole-revolution branch is arbitrary, so snap
+    // the mean onto the one nearest zero - a whole number of revolutions,
+    // which cannot absorb anything physical.
+    std::vector<double> unwrapped(raw.size());
+    unwrapped[0] = raw[0];
+    for (size_t i = 1; i < raw.size(); i++)
+    {
+        double delta = raw[i] - raw[i - 1];
+        delta -= 4096.0 * std::round(delta / 4096.0);
+        unwrapped[i] = unwrapped[i - 1] + delta;
+    }
+    std::vector<double> error(raw.size());
+    double mean = 0.0;
+    for (size_t i = 0; i < raw.size(); i++)
+    {
+        error[i] = unwrapped[i] - stepPos[i] * COUNTS_PER_MICROSTEP;
+        mean += error[i];
+    }
+    mean /= (double)raw.size();
+    const double branch = 4096.0 * std::round(mean / 4096.0);
+    for (size_t i = 0; i < error.size(); i++)
+        error[i] -= branch;
+
+    // Closure: an absolute sensor must come back to itself after a whole
+    // revolution of the motor, so this is a direct check that no steps were
+    // lost, independent of anything the fit does.
+    double closure = 0.0;
+    if (raw.size() >= (size_t)N_STEPS + 1)
+        closure = (unwrapped[N_STEPS] - unwrapped[0]) - N_STEPS * STEP * COUNTS_PER_MICROSTEP;
+
+    // Repeatability: the same commanded position, one revolution apart.
+    double repeatability = 0.0;
+    if (CAL_REPEATS >= 2)
+    {
+        double sumSq = 0.0;
+        double sumDiff = 0.0;
+        for (int i = 0; i < N_STEPS; i++)
+            sumDiff += error[i + N_STEPS] - error[i];
+        double meanDiff = sumDiff / N_STEPS;
         for (int i = 0; i < N_STEPS; i++)
         {
-            // Fine-grained markers around each sub-operation, deliberately
-            // at INFO (DEBUG is compiled out - CONFIG_LOG_MAXIMUM_LEVEL=3):
-            // this loop is the one that has hung the device outright on
-            // 4/4 live attempts (see memory/rotator_angle_cal_hang.md), at
-            // different, unpredictable points each time, and the real
-            // rotator has no UART console - the in-memory /log ring buffer
-            // (LogBuffer.c, 200 lines) is the only way to see what the last
-            // thing running was. Whichever of these markers is the last one
-            // in the buffer after a hang narrows down which sub-operation
-            // stopped returning.
-            ESP_LOGI("Sensor Calibration", "step %d/%d: forwardStep", i + 1, N_STEPS);
-            stepper->forwardStep();
-            ESP_LOGI("Sensor Calibration", "step %d/%d: forwardStep done, delay(20)", i + 1, N_STEPS);
-            delay(20);
-            ESP_LOGI("Sensor Calibration", "step %d/%d: measuring (64-sample AS5600 average)", i + 1, N_STEPS);
-            double raw = FMOD4096(MEASURE_PRECISE_ANGLE_DOUBLE(64));
-            double ideal = 4096.0 * i / N_STEPS;
-            double err = raw - ideal;
-            err -= 4096.0 * std::round(err / 4096.0); // wrap to (-2048, 2048]
-            avgErr[i] += err;
-            ESP_LOGI("Sensor Calibration", "Rev %d/%d, Step: %3d, Sensor: %.1f", r + 1, CAL_REPEATS, i + 1, raw);
-            onProgress(100 * (r * N_STEPS + i) / (CAL_REPEATS * N_STEPS));
-            ESP_LOGI("Sensor Calibration", "step %d/%d: progress sent", i + 1, N_STEPS);
+            double d = (error[i + N_STEPS] - error[i]) - meanDiff;
+            sumSq += d * d;
         }
+        repeatability = std::sqrt(sumSq / N_STEPS);
     }
-    std::vector<double> avgRaw(N_STEPS);
-    for (int i = 0; i < N_STEPS; i++)
-        avgRaw[i] = 4096.0 * i / N_STEPS + avgErr[i] / CAL_REPEATS;
 
-    // how good were the coefficients already in effect, judged against this
-    // fresh sweep? (uses C0/A/B as they stand before calibrateAngleSensorFinalize
-    // overwrites them below)
-    ResidualStats before = computeResidual(avgRaw);
+    // How good were the coefficients already in effect, judged against this
+    // fresh sweep? Measured before the fit below overwrites them.
+    ResidualStats before = computeResidual(raw, error);
 
     calibrateAngleSensorInit();
-    for (int i = 0; i < N_STEPS; i++)
-        calibrateAngleSensorStep(avgRaw[i]);
-    calibrateAngleSensorFinalize();
+    for (size_t i = 0; i < raw.size(); i++)
+        calibrateAngleSensorStep(raw[i], error[i]);
+    if (!calibrateAngleSensorFinalize())
+    {
+        ESP_LOGE("Sensor Calibration", "Fit is singular - coefficients left untouched");
+        return {before.rmsDeg, before.rmsDeg, before.peakDeg, closure, repeatability};
+    }
 
-    ResidualStats after = computeResidual(avgRaw);
+    ResidualStats after = computeResidual(raw, error);
 
     ESP_LOGI("Sensor Calibration", "C0 = %.4f", C0);
     for (int k = 1; k <= KMAX; k++)
-    {
         ESP_LOGI("Sensor Calibration", "A%d = %.4f, B%d = %.4f", k, A[k], k, B[k]);
-    }
-    ESP_LOGI("Sensor Calibration", "Residual RMS: before=%.4f deg, after=%.4f deg (peak after=%.4f deg)",
-             before.rmsDeg, after.rmsDeg, after.peakDeg);
+    ESP_LOGI("Sensor Calibration",
+             "Residual RMS: before=%.4f deg, after=%.4f deg (peak after=%.4f deg); "
+             "closure=%.3f counts, repeatability=%.3f counts",
+             before.rmsDeg, after.rmsDeg, after.peakDeg, closure, repeatability);
+    if (std::fabs(closure) > 2.0)
+        ESP_LOGW("Sensor Calibration",
+                 "Closure %.3f counts is too large to trust - steps were probably lost",
+                 closure);
 
-    // store new values in configuration and persist them - previously these
-    // were only written to the in-memory ConfigData (all setters called with
-    // save=false and nothing ever called save() afterwards), so a
-    // calibration run was silently lost on the next restart.
+    // Persist. Writing the coefficients bumps the calibration generation,
+    // which is what marks the stored mechanical zero and full-step table as
+    // no longer belonging to this correction (see Configuration.cpp).
     auto &cfg = Configuration::getInstance();
     for (int k = 0; k <= KMAX; k++)
     {
@@ -807,70 +898,125 @@ RotatorHW::CalibrationResult RotatorHW::calibrateAngleSensor(std::function<void(
     cfg.setC0(C0, false);
     cfg.save();
 
-    // set driver back to 256 microsteps
-    stepper_driver.setMicrostepsPerStep(256);
-
-    return {before.rmsDeg, after.rmsDeg, after.peakDeg};
+    return {before.rmsDeg, after.rmsDeg, after.peakDeg, closure, repeatability};
 }
 
 void RotatorHW::calibrateAngleSensorInit(void)
 {
-    // reset all relevant parameters
-    step_counter = 0;
-    sum0 = 0;
-    for (int k = 1; k <= KMAX; ++k)
+    for (int i = 0; i < CAL_TERMS; ++i)
     {
-        sumC[k] = 0;
-        sumS[k] = 0;
+        _atb[i] = 0.0;
+        for (int j = 0; j < CAL_TERMS; ++j)
+            _ata[i][j] = 0.0;
     }
 }
 
-void RotatorHW::calibrateAngleSensorStep(double sensor_raw)
+void RotatorHW::calibrateAngleSensorStep(double sensor_raw, double error)
 {
-    if (step_counter >= N_STEPS)
-        return;
-
-    // 1) ideal target value
-    double ideal = 4096.0f * step_counter / (double)N_STEPS;
-
-    // 2) error
-    double e = sensor_raw - ideal;
-
-    // 3) sum offsets
-    sum0 += e;
-
-    // 4) sum up harmonic parts, correlated against the *actually measured*
-    // angle - not an angle accumulated from the step index. correctSensorReading()
-    // evaluates cos(k*theta)/sin(k*theta) at the raw reading it is given, so the
-    // fit has to use that same theta or the harmonics come out phase-rotated by
+    // Correlated against the *actually measured* angle, not an angle
+    // accumulated from the step index. correctSensorReading() evaluates
+    // cos(k*theta)/sin(k*theta) at the raw reading it is given, so the fit
+    // has to use that same theta or the harmonics come out phase-rotated by
     // (this run's starting angle) * k as soon as a calibration run does not
     // happen to start at sensor_raw == 0. That is what produced a ~50 degree
-    // "before" residual on a run started away from raw 0: the old fit's basis
-    // was anchored to step 0 rather than to the sensor's own zero.
+    // "before" residual on a run started away from raw 0: the old fit's
+    // basis was anchored to step 0 rather than to the sensor's own zero.
     double theta = 2.0 * M_PI * sensor_raw / 4096.0;
+    double basis[CAL_TERMS];
+    basis[0] = 1.0;
     for (int k = 1; k <= KMAX; ++k)
     {
-        sumC[k] += e * cos(k * theta);
-        sumS[k] += e * sin(k * theta);
+        basis[2 * k - 1] = cos(k * theta);
+        basis[2 * k] = sin(k * theta);
     }
-
-    step_counter++;
+    for (int i = 0; i < CAL_TERMS; ++i)
+    {
+        _atb[i] += basis[i] * error;
+        for (int j = i; j < CAL_TERMS; ++j)
+            _ata[i][j] += basis[i] * basis[j];
+    }
 }
 
-void RotatorHW::calibrateAngleSensorFinalize(void)
+bool RotatorHW::calibrateAngleSensorFinalize(void)
 {
-    if (step_counter < N_STEPS)
-        return;
-
-    // 1) Offset
-    C0 = sum0 / (double)N_STEPS;
-
-    // 2) Fourier-Koeffizienten (2/N-Normierung)
-    for (int k = 1; k <= KMAX; k++)
+    // Gaussian elimination with partial pivoting on the normal equations.
+    // Eleven unknowns in a basis that is near-orthogonal over a revolution,
+    // so this is well conditioned; the singular check exists for the case
+    // where a sweep aborted early and left too few observations.
+    double m[CAL_TERMS][CAL_TERMS + 1];
+    for (int i = 0; i < CAL_TERMS; ++i)
     {
-        A[k] = 2.0 * sumC[k] / N_STEPS;
-        B[k] = 2.0 * sumS[k] / N_STEPS;
+        for (int j = 0; j < CAL_TERMS; ++j)
+            m[i][j] = (j >= i) ? _ata[i][j] : _ata[j][i]; // accumulated upper triangle only
+        m[i][CAL_TERMS] = _atb[i];
     }
+    for (int col = 0; col < CAL_TERMS; ++col)
+    {
+        int pivot = col;
+        for (int r = col + 1; r < CAL_TERMS; ++r)
+            if (std::fabs(m[r][col]) > std::fabs(m[pivot][col]))
+                pivot = r;
+        if (std::fabs(m[pivot][col]) < 1e-9)
+            return false;
+        if (pivot != col)
+            for (int j = col; j <= CAL_TERMS; ++j)
+                std::swap(m[col][j], m[pivot][j]);
+        for (int r = col + 1; r < CAL_TERMS; ++r)
+        {
+            double f = m[r][col] / m[col][col];
+            for (int j = col; j <= CAL_TERMS; ++j)
+                m[r][j] -= f * m[col][j];
+        }
+    }
+    double x[CAL_TERMS];
+    for (int i = CAL_TERMS - 1; i >= 0; --i)
+    {
+        double sum = m[i][CAL_TERMS];
+        for (int j = i + 1; j < CAL_TERMS; ++j)
+            sum -= m[i][j] * x[j];
+        x[i] = sum / m[i][i];
+    }
+
+    C0 = x[0];
+    A[0] = 0.0;
+    B[0] = 0.0;
+    for (int k = 1; k <= KMAX; ++k)
+    {
+        A[k] = x[2 * k - 1];
+        B[k] = x[2 * k];
+    }
+    return true;
+}
+
+RotatorHW::ResidualStats RotatorHW::computeResidual(const std::vector<double> &raw,
+                                                    const std::vector<double> &error)
+{
+    // What the currently active correction leaves behind on this sweep. The
+    // correction subtracts its model from the reading, so the residual is
+    // just the measured error minus what the model predicts at that reading,
+    // with the mean removed - a constant offset is the correction's own zero
+    // point, not an error.
+    constexpr double DEG_PER_COUNT = 360.0 / 4096.0;
+    const size_t n = raw.size();
+    if (n == 0)
+        return {0.0, 0.0};
+    std::vector<double> residual(n);
+    double mean = 0.0;
+    for (size_t i = 0; i < n; i++)
+    {
+        residual[i] = error[i] - (raw[i] - correctSensorReading(raw[i]));
+        mean += residual[i];
+    }
+    mean /= (double)n;
+    double sumSq = 0.0;
+    double peak = 0.0;
+    for (size_t i = 0; i < n; i++)
+    {
+        double e = residual[i] - mean;
+        sumSq += e * e;
+        peak = std::max(peak, std::fabs(e));
+    }
+    return {std::sqrt(sumSq / n) * DEG_PER_COUNT, peak * DEG_PER_COUNT};
 }
 
 void RotatorHW::setAngleCalCoefficients(double c0, const double a[KMAX + 1], const double b[KMAX + 1])
@@ -890,23 +1036,6 @@ void RotatorHW::setAngleCalCoefficients(double c0, const double a[KMAX + 1], con
     }
     cfg.setC0(C0, false);
     cfg.save();
-}
-
-RotatorHW::ResidualStats RotatorHW::computeResidual(const std::vector<double> &avgRaw)
-{
-    constexpr double DEG_PER_COUNT = 360.0 / 4096.0;
-    double sumSq = 0.0;
-    double peak = 0.0;
-    for (int i = 0; i < N_STEPS; i++)
-    {
-        double ideal = 4096.0 * i / N_STEPS;
-        double err = correctSensorReading(avgRaw[i]) - ideal;
-        err -= 4096.0 * std::round(err / 4096.0); // wrap to (-2048, 2048]
-        sumSq += err * err;
-        peak = std::max(peak, std::fabs(err));
-    }
-    double rmsCounts = std::sqrt(sumSq / N_STEPS);
-    return {rmsCounts * DEG_PER_COUNT, peak * DEG_PER_COUNT};
 }
 
 double RotatorHW::correctSensorReading(double sensorReading)

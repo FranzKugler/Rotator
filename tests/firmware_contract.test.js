@@ -11,6 +11,8 @@ const expertLock = readFileSync(new URL('../main/ExpertLock.c', import.meta.url)
 const fileRoutes = readFileSync(new URL('../main/FileRoutes.c', import.meta.url), 'utf8');
 const nvsRoutes = readFileSync(new URL('../main/NvsRoutes.c', import.meta.url), 'utf8');
 const logBuffer = readFileSync(new URL('../main/LogBuffer.c', import.meta.url), 'utf8');
+const configuration = readFileSync(new URL('../main/Configuration.cpp', import.meta.url), 'utf8');
+const rotatorHeader = readFileSync(new URL('../main/RotatorHW.h', import.meta.url), 'utf8');
 
 describe('WLAN firmware contract', () => {
   it('provides current WLAN state and hostname endpoints', () => {
@@ -60,10 +62,52 @@ describe('Sensor calibration firmware contract', () => {
 
   it('reports before/after residual quality from a calibration run', () => {
     expect(rotatorHW).toContain('CalibrationResult RotatorHW::calibrateAngleSensor(');
-    expect(rotatorHW).toContain('computeResidual(avgRaw)');
+    expect(rotatorHW).toContain('computeResidual(raw, error)');
     expect(webServer).toContain('\\"residualBeforeDeg\\"');
     expect(webServer).toContain('\\"residualAfterDeg\\"');
     expect(webServer).toContain('\\"peakAfterDeg\\"');
+  });
+
+  it('reports the two checks that say whether a run can be trusted at all', () => {
+    // A residual only means something if the sweep itself was sound. Closure
+    // says no steps were lost - the AS5600 is absolute, so a clean revolution
+    // comes back to itself - and repeatability between the two repeats is the
+    // noise floor the residual has to be judged against. Reporting the
+    // residual without them invites trusting a number from a broken run.
+    expect(rotatorHeader).toContain('double closureCounts;');
+    expect(rotatorHeader).toContain('double repeatabilityCounts;');
+    expect(webServer).toContain('\\"closureCounts\\"');
+    expect(webServer).toContain('\\"repeatabilityCounts\\"');
+  });
+
+  it('keeps the correction and everything derived from it on one generation', () => {
+    // The mechanical zero is stored as a corrected sensor value and the
+    // full-step table is indexed by one, so both are only meaningful
+    // alongside the coefficients they were measured against. Live on
+    // 2026-09-19 a table left over from a previous correction was found
+    // injecting 353 mdeg peak to peak with nothing reporting it. Every write
+    // of the coefficients bumps a generation; the two derived artefacts are
+    // stamped with it and checked at load.
+    expect(configuration).toContain('ANGLECAL_MAGIC');
+    expect(configuration).toContain('blob.generation');
+    expect(configuration).toContain('FULLSTEP_GEN_NVS_KEY');
+    expect(rotatorHW).toContain('"zeroGen"');
+    expect(rotatorHW).toContain('_zeroCalibrationStale');
+    expect(webServer).toContain('"/api/calibration/status"');
+    // A stale table is dropped rather than applied: all-zero is a no-op,
+    // a mismatched one is a confident wrong answer.
+    const load = configuration.slice(configuration.indexOf('bool Configuration::loadFullStepTableFromNvs()'));
+    const body = load.slice(0, load.indexOf('\n}'));
+    expect(body).toContain('fullStepTable.fill(0.0f)');
+    // ...but an already-zero table is a no-op correction and belongs to every
+    // generation, so it must not be reported as orphaned forever.
+    expect(body).toContain('allZero');
+  });
+
+  it('migrates a pre-header calibration instead of silently discarding it', () => {
+    expect(configuration).toContain('LegacyAngleCalBlob');
+    const load = configuration.slice(configuration.indexOf('bool Configuration::loadAngleCalFromNvs()'));
+    expect(load.slice(0, load.indexOf('\n}'))).toContain('sizeof(LegacyAngleCalBlob)');
   });
 
   it('fits the harmonics against the actually measured angle, not the ideal step angle', () => {
@@ -84,31 +128,56 @@ describe('Sensor calibration firmware contract', () => {
     expect(body).toContain('sin(k * theta)');
   });
 
-  it('steps in true full-step mode and never attempts to rescale the position counter afterwards', () => {
-    // Regression test, the other direction from most of the ones above: two
-    // different live-tested "fixes" for the fact that full-step mode leaves
-    // FastAccelStepper's position counter undercounting by up to 256x
-    // (switching back to 256 microsteps and rescaling via one large
-    // setCurrentPosition() jump, and moving MICROSTEPS pulses at the normal
-    // resolution instead of ever entering full-step mode) both made live
-    // results *worse* than the original forwardStep()-in-full-step-mode
-    // behaviour, not better - one corrupted the counter into a nonsense
-    // multi-million-step reading, the other produced measurably worse
-    // calibration fits even at a single repeat. Whatever is actually wrong is
-    // a deeper cross-task FastAccelStepper reliability issue that neither
-    // attempt fixed, so don't reintroduce either of them here without first
-    // resolving that separately and re-validating on the bench. The
-    // consequence of leaving this alone: the position counter is left
-    // undercounted after every calibration run, so gotoMechanicalZero() must
-    // be re-run before trusting absolute position commands.
+  it('sweeps at the normal microstep resolution and never switches the driver', () => {
+    // This reverses an earlier contract, on the strength of a bench campaign
+    // that the earlier one explicitly asked for before it could be reversed
+    // ("don't reintroduce either of them here without first resolving that
+    // separately and re-validating on the bench").
+    //
+    // The old routine switched the driver to full-step mode and used
+    // forwardStep(), which leaves FastAccelStepper's position counter
+    // undercounting by up to 256x and forces a re-home afterwards, and which
+    // is the prime suspect for the hangs that killed 4 of 4 live attempts.
+    // Moving 256 microsteps at the normal resolution had been tried once and
+    // judged "measurably worse", but that attempt kept the rest of the
+    // routine as it was - in particular a 20 ms settle, far too short for a
+    // 256-microstep move to stop ringing, and a fit anchored to the sweep's
+    // own first step rather than to the machine's zero.
+    //
+    // Re-measured on 2026-09-18/19 with a settle of 250 ms and an absolute
+    // reference: two independent sweeps agreeing within a few percent on
+    // every harmonic, closure over a revolution within 0.5 counts, forward
+    // repeatability 0.149 counts, residual 0.347 counts (3.0 mdeg of output
+    // angle) - and the result verified end to end against an independent
+    // output-shaft camera. See scripts/calib/RESULTS.md.
     const body = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::calibrateAngleSensor('));
     const fn = body.slice(0, body.indexOf('\n}'));
     const liveCode = fn.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
-    expect(liveCode).toContain('setMicrostepsPerStep(1)');
-    expect(liveCode).toContain('forwardStep()');
-    expect(liveCode).toContain('setMicrostepsPerStep(256)');
+    expect(liveCode).not.toContain('setMicrostepsPerStep');
+    expect(liveCode).not.toContain('forwardStep()');
     expect(liveCode).not.toContain('setStepPositionSafe');
-    expect(liveCode).not.toContain('MOVE_WAIT');
+    expect(liveCode).toContain('MOVE_WAIT');
+  });
+
+  it('references the fit to the absolute step counter, not to the sweep\'s own start', () => {
+    // The mechanical-zero target is stored as a *corrected* sensor value, so
+    // the constant term of the correction decides where the machine thinks
+    // zero is. Anchoring the fit to the sweep's first step made that constant
+    // depend on wherever the sweep happened to begin, which is why every
+    // recalibration used to silently move the zero. Against the step counter
+    // it is a property of the machine instead.
+    const body = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::calibrateAngleSensor('));
+    const fn = body.slice(0, body.indexOf('\n}'));
+    expect(fn).toContain('COUNTS_PER_MICROSTEP');
+    expect(fn).not.toMatch(/ideal\s*=\s*4096\.0f?\s*\*\s*step_counter/);
+  });
+
+  it('settles long enough after each step for the reading to mean anything', () => {
+    const body = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::calibrateAngleSensor('));
+    const fn = body.slice(0, body.indexOf('\n}'));
+    const settle = fn.match(/SETTLE_MS\s*=\s*(\d+)/);
+    expect(settle).not.toBeNull();
+    expect(Number(settle[1])).toBeGreaterThanOrEqual(150);
   });
 
   it('serializes access to the stepper position counter across tasks', () => {

@@ -22,7 +22,7 @@ everything downstream cannot be seen by it at all.
 
 | Step | Script | What it establishes |
 |---|---|---|
-| 1 | `sweep_fullstep.py` | raw sensor at each of the 400 full steps, forward and reverse |
+| 1 | `sweep_fullstep.py` | raw sensor at each of the 400 full steps, forward and reverse. The firmware now does the same thing itself - `GET /api/calibration/angle/stream` - so this is the research version, not the only way |
 | 2 | `fit_sensor.py` | Fourier correction, order chosen from the data; hysteresis and repeatability |
 | 3 | `plot_sensor.py` | the calibration graphs |
 | 4 | `upload_coefficients.py` | writes the fit to the device without moving its zero |
@@ -110,6 +110,9 @@ It reproduced across two runs taken at different step spacings, agreeing to
 0.8 degrees of phase on its dominant term, so it is a fixed property of the
 machine and correctable - but only against an external reference.
 
-The device's stored correction format is KMAX = 4 (`main/RotatorHW.h`), so
-only orders up to 4 can be uploaded: 4.8 mdeg residual instead of order 5's
-3.0. Raising it is a persistent-format change and has not been done.
+The device stores orders up to KMAX = 5 as of v0.10.0, with the NVS blob
+carrying its own KMAX and migrating a smaller one. Coefficients, mechanical
+zero and full-step table share a generation number so a correction replaced
+without re-measuring the other two is reported rather than silently applied -
+`GET /api/calibration/status`, and `upload_coefficients.py --keep-zero` for
+the one case where the caller has arranged for the zero to stay valid.

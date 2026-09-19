@@ -69,6 +69,18 @@ public:
     void getFullStepTable(float outTable[N_STEPS]) const;
     void setFullStepTable(const float table[N_STEPS]);
 
+    // Which calibration the stored correction is. Bumped whenever the
+    // coefficients actually change, and stamped into the two artefacts
+    // derived from them - the full-step table here and the mechanical-zero
+    // target in RotatorHW - so that a correction replaced without
+    // re-measuring those can be detected instead of silently misapplied.
+    // See the comment on AngleCalBlob in Configuration.cpp.
+    uint32_t calibrationGeneration() const { return _generation; }
+
+    // True when the stored full-step table belonged to a different
+    // calibration and was therefore dropped at load.
+    bool fullStepTableStale() const { return _fullStepTableStale; }
+
 private:
     Configuration();              // mountet FS und lädt JSON
     ~Configuration();
@@ -94,4 +106,13 @@ private:
 
     mutable std::mutex _mtx;      // for thread safety
     ConfigData _data;
+    uint32_t _generation = 0;
+    bool _fullStepTableStale = false;
+    // Which calibration generation the in-memory full-step table belongs to,
+    // carried separately from _generation so an unrelated save() cannot
+    // promote a stale table to current.
+    uint32_t _fullStepTableGen = 0;
+    // Set when load() migrated a pre-header blob, so the constructor can
+    // write it back once in the current format.
+    bool _migratedAngleCal = false;
 };

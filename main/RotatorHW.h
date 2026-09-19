@@ -11,7 +11,14 @@
 #include <vector>
 
 #define N_STEPS 400 // No of fullsteps for calibration
-#define KMAX 4      // up to KMAX Fourier coefficients
+// Highest Fourier harmonic in the sensor correction. Measured on the bench
+// 2026-09-18: harmonics 1..5 carry 8.6, 4.8, 1.3, 3.3 and 0.6 AS5600 counts
+// and everything from the sixth on carries 0.02-0.03, i.e. noise. Five is
+// where the data stops improving - order 4 leaves 4.8 mdeg of output angle
+// where order 5 leaves 3.0. Raising it is a persistent-format change; the
+// NVS blob carries its own KMAX and migrates a smaller one (see
+// Configuration.cpp).
+#define KMAX 5      // up to KMAX Fourier coefficients
 
 class RotatorHW
 {
@@ -98,7 +105,28 @@ public:
         double residualBeforeDeg;
         double residualAfterDeg;
         double peakAfterDeg;
+        // How far the unwrapped sensor reading drifted from a whole
+        // revolution over the sweep. The AS5600 is absolute, so a clean run
+        // closes on itself: anything much above a count means steps were
+        // lost and the fit should not be trusted.
+        double closureCounts;
+        // Spread between repeats at the same commanded position - the noise
+        // floor the residual above should be judged against.
+        double repeatabilityCounts;
     };
+
+    // Whether the stored mechanical zero and full-step table still belong to
+    // the correction currently in force - see Configuration.cpp's
+    // AngleCalBlob comment for why they can stop belonging to it.
+    struct CalibrationStatus
+    {
+        uint32_t generation;
+        int kmax;
+        bool zeroStale;
+        bool fullStepTableStale;
+        int16_t zeroPosSensorValue;
+    };
+    CalibrationStatus getCalibrationStatus() const;
 
     // external accessors
     bool getIsMoving()
@@ -292,18 +320,23 @@ private:
     bool withinMotionLimit(long targetSteps);
 
     // sensor calibration
+    // Least-squares fit of the correction, accumulated one observation at a
+    // time so the sweep never has to hold a design matrix. Init clears the
+    // normal equations, Step adds (reading, error) and Finalize solves them
+    // into C0/A/B.
     void calibrateAngleSensorInit(void);
-    void calibrateAngleSensorStep(double sensor_raw);
-    void calibrateAngleSensorFinalize(void);
+    void calibrateAngleSensorStep(double sensor_raw, double error);
+    bool calibrateAngleSensorFinalize(void);
     struct ResidualStats
     {
         double rmsDeg;
         double peakDeg;
     };
     // RMS/peak error of the *currently active* correction (whatever is in
-    // C0/A/B right now) against a sweep of averaged raw readings indexed by
-    // ideal step position.
-    ResidualStats computeResidual(const std::vector<double> &avgRaw);
+    // C0/A/B right now) against a sweep, judged against the absolute step
+    // counter rather than against the sweep's own first point.
+    ResidualStats computeResidual(const std::vector<double> &raw,
+                                  const std::vector<double> &error);
 
 private:
     bool _isMoving;
@@ -339,16 +372,24 @@ private:
     // or deadlock with, a user-commanded operation.
     SemaphoreHandle_t motionMutex;
 
-    // internal calibration values
-    double sumC[KMAX + 1];
-    double sumS[KMAX + 1];
-    double sum0;
+    // internal calibration values. The fit is ordinary least squares over
+    // the basis [1, cos k.theta, sin k.theta] - normal equations, since with
+    // eleven unknowns that is a trivially small solve and needs no matrix
+    // library. It replaces the direct 2/N Fourier projection this used to
+    // do, which is only exact when the samples are evenly spaced in theta;
+    // theta here is the *measured* angle, which is unevenly spaced by
+    // precisely the error being fitted.
+    static constexpr int CAL_TERMS = 2 * KMAX + 1;
+    double _ata[CAL_TERMS][CAL_TERMS];
+    double _atb[CAL_TERMS];
     double C0;
     double A[KMAX + 1];
     double B[KMAX + 1];
-    int step_counter;
     // See setFullStepTable()'s comment.
     float _fullStepTable[N_STEPS];
+    // Set at load when the stored zero carries a different calibration
+    // generation than the correction in force - see the constructor.
+    bool _zeroCalibrationStale = false;
 
     // Instantiate TMC2209
     TMC2209 stepper_driver;

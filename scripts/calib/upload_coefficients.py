@@ -47,6 +47,13 @@ def main():
                     help="also clear the 400-entry full-step residual table, which "
                          "was fitted against the previous correction and is not "
                          "valid against this one")
+    ap.add_argument("--keep-zero", action="store_true",
+                    help="tell the device the mechanical zero stays valid. Only "
+                         "correct because the C0 shift above makes the new "
+                         "correction agree with the old one at the homing point; "
+                         "without it the device marks the zero as no longer "
+                         "belonging to this calibration, which is the right "
+                         "default for any other caller")
     ap.add_argument("--apply", action="store_true", help="actually write to the device")
     args = ap.parse_args()
 
@@ -84,7 +91,10 @@ def main():
         print("\n(dry run - pass --apply to write)")
         return
 
-    rotator.set_coefficients(shifted, a, b)
+    payload = {"C0": shifted, "A": a, "B": b}
+    if args.keep_zero:
+        payload["keepZero"] = True
+    rotator._post("/api/calibration/coefficients", payload)
     back = rotator.get_coefficients()
     print(f"\nwrote coefficients; device now reports C0={back['C0']:.4f}")
     if args.zero_fullstep_table:

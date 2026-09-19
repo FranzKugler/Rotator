@@ -399,6 +399,36 @@ static esp_err_t get_coefficients_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/**
+ * GET /api/calibration/status
+ *
+ * Which calibration is in force, and whether the two artefacts derived from
+ * it - the mechanical-zero target and the full-step residual table - still
+ * belong to it. They can stop belonging to it silently: both are expressed
+ * in terms of the correction that was active when they were measured, so
+ * replacing the coefficients orphans them without any of the three saying
+ * so. Configuration.cpp's AngleCalBlob comment has the full reasoning and
+ * the 353 mdeg the case cost live.
+ *
+ * Not expert-gated: it reports state and moves nothing.
+ */
+static esp_err_t calibration_status_handler(httpd_req_t *req)
+{
+    auto status = RotatorHW::getInstance().getCalibrationStatus();
+    char buf[224];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"generation\":%lu,\"kmax\":%d,\"zeroStale\":%s,"
+        "\"fullStepTableStale\":%s,\"zeroPosSensorValue\":%d,\"consistent\":%s}",
+        (unsigned long)status.generation, status.kmax,
+        status.zeroStale ? "true" : "false",
+        status.fullStepTableStale ? "true" : "false",
+        (int)status.zeroPosSensorValue,
+        (!status.zeroStale && !status.fullStepTableStale) ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+
 static esp_err_t set_coefficients_handler(httpd_req_t *req)
 {
     if (!expert_lock_guard(req)) return ESP_FAIL;
@@ -434,9 +464,26 @@ static esp_err_t set_coefficients_handler(httpd_req_t *req)
         b[k] = bi->valuedouble;
     }
     double c0 = c0Item->valuedouble;
+    // Replacing the coefficients normally orphans the stored mechanical zero,
+    // because that zero is a corrected sensor value. A caller can arrange for
+    // it to stay valid - shifting C0 so the correction agrees with the old one
+    // at the homing point does exactly that, and is what
+    // scripts/calib/upload_coefficients.py exists to do. Only such a caller
+    // may say so, and it has to say so explicitly.
+    cJSON *keepZeroItem = cJSON_GetObjectItem(root, "keepZero");
+    bool keepZero = cJSON_IsTrue(keepZeroItem);
     cJSON_Delete(root);
 
-    RotatorHW::getInstance().setAngleCalCoefficients(c0, a, b);
+    auto &rotator = RotatorHW::getInstance();
+    int16_t zeroBefore = rotator.getCalibrationStatus().zeroPosSensorValue;
+    rotator.setAngleCalCoefficients(c0, a, b);
+    if (keepZero)
+    {
+        // Re-stamp the unchanged zero onto the new generation.
+        rotator.setZeroPosSensorValue(zeroBefore);
+        ESP_LOGI(TAG, "Coefficients replaced with keepZero - mechanical zero %d re-stamped",
+                 (int)zeroBefore);
+    }
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
@@ -631,10 +678,13 @@ static esp_err_t calibration_angle_stream(httpd_req_t *req)
             snprintf(d, sizeof(d), "%d", pct);
             send_event("progress", d);
         });
-    char resultJson[128];
+    char resultJson[224];
     snprintf(resultJson, sizeof(resultJson),
-             "{\"residualBeforeDeg\":%.4f,\"residualAfterDeg\":%.4f,\"peakAfterDeg\":%.4f}",
-             result.residualBeforeDeg, result.residualAfterDeg, result.peakAfterDeg);
+             "{\"residualBeforeDeg\":%.4f,\"residualAfterDeg\":%.4f,\"peakAfterDeg\":%.4f,"
+             "\"closureCounts\":%.3f,\"repeatabilityCounts\":%.3f,\"generation\":%lu}",
+             result.residualBeforeDeg, result.residualAfterDeg, result.peakAfterDeg,
+             result.closureCounts, result.repeatabilityCounts,
+             (unsigned long)RotatorHW::getInstance().getCalibrationStatus().generation);
     send_event("complete_angle", resultJson);
 
     if (!clientGone)
@@ -1053,6 +1103,13 @@ void register_web_handles(httpd_handle_t server)
         .handler = position_goto_handler,
         .user_ctx = NULL};
     httpd_register_uri_handler(server, &position_goto);
+
+    httpd_uri_t calibration_status = {
+        .uri = "/api/calibration/status",
+        .method = HTTP_GET,
+        .handler = calibration_status_handler,
+        .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &calibration_status);
 
     httpd_uri_t coefficients_get = {
         .uri = "/api/calibration/coefficients",
