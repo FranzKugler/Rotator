@@ -11,5 +11,5 @@
 // occasionally so it stays a plausible fallback, but it never has to be
 // exact for a tagged build to report correctly.
 #ifndef ROTATOR_VERSION
-#define ROTATOR_VERSION "0.12.0"
+#define ROTATOR_VERSION "0.12.1"
 #endif

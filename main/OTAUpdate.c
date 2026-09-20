@@ -638,6 +638,36 @@ static esp_err_t install_handler(httpd_req_t *req)
     return send_status(req);
 }
 
+/**
+ * Erase the filesystem partition lazily, one block at a time, just ahead of
+ * where the next write lands.
+ *
+ * Erasing all 10 MB up front takes about twenty-four seconds, and for that
+ * whole time the upload's socket goes unread while the sender keeps
+ * pushing. Live on 2026-09-20 that dropped two uploads in a row, each time
+ * leaving the partition erased and the device with no web UI at all -
+ * strictly worse than a refused upload, and the sort of failure that is
+ * hard to recover from if the browser is the only way in. Raising httpd's
+ * receive timeout did not fix it; not stalling at all does.
+ *
+ * `*erasedUpTo` tracks how far the partition has been erased. Block-sized
+ * steps keep the flash driver on its block-erase path rather than making it
+ * erase sector by sector.
+ */
+static esp_err_t erase_up_to(const esp_partition_t *partition, size_t needed, size_t *erasedUpTo)
+{
+    const size_t BLOCK = 64 * 1024;
+    while (*erasedUpTo < needed) {
+        size_t remaining = partition->size - *erasedUpTo;
+        size_t span = remaining < BLOCK ? remaining : BLOCK;
+        if (span == 0) break;
+        esp_err_t error = esp_partition_erase_range(partition, *erasedUpTo, span);
+        if (error != ESP_OK) return error;
+        *erasedUpTo += span;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t upload_handler(httpd_req_t *req)
 {
     if (!expert_lock_guard(req)) return ESP_FAIL;
@@ -674,14 +704,14 @@ static esp_err_t upload_handler(httpd_req_t *req)
 
     esp_ota_handle_t handle = 0;
     esp_err_t error;
+    size_t erasedUpTo = 0;
     if (firmware) error = esp_ota_begin(partition, req->content_len, &handle);
-    else {
-        error = esp_vfs_littlefs_unregister(LITTLEFS_CONF.partition_label);
-        if (error == ESP_OK) error = esp_partition_erase_range(partition, 0, partition->size);
-    }
+    else error = esp_vfs_littlefs_unregister(LITTLEFS_CONF.partition_label);
     size_t written = 0;
     int chunk = first;
     while (error == ESP_OK && chunk > 0) {
+        if (!firmware) error = erase_up_to(partition, written + chunk, &erasedUpTo);
+        if (error != ESP_OK) break;
         error = firmware ? esp_ota_write(handle, buffer, chunk)
                          : esp_partition_write(partition, written, buffer, chunk);
         written += chunk;

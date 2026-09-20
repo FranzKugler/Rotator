@@ -154,6 +154,15 @@ extern "C" void app_main(void)
     // explicitly skips sessions marked for_async_req, so the run's own
     // socket is never the one reclaimed.
     http_cfg.lru_purge_enable = true;
+    // The default five seconds is not enough for a filesystem upload. That
+    // handler erases the whole 10 MB littlefs partition in one call before
+    // it reads the rest of the body, and the erase alone outlasts the
+    // default - a live upload on 2026-09-20 timed out mid-write and left
+    // the device with an erased partition and no web UI at all, which is a
+    // far worse state than a refused upload. Twenty seconds covers the
+    // erase with room to spare; a client that stalls that long is now
+    // reclaimable anyway, thanks to the LRU purge above.
+    http_cfg.recv_wait_timeout = 20;
     httpd_handle_t server = nullptr;
     ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));
 

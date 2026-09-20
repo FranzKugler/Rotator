@@ -297,6 +297,17 @@ describe('Calibration runs off the HTTP server task', () => {
   it('lets the server reclaim idle sockets, now that a run holds one for half an hour', () => {
     expect(mainCpp).toContain('lru_purge_enable = true');
   });
+
+  it('gives an upload long enough to survive the filesystem erase', () => {
+    // The filesystem upload handler erases all 10 MB of the littlefs
+    // partition in one call before reading the rest of the body, and that
+    // erase alone outlasts httpd's five-second default. A live upload timed
+    // out mid-write and left the device with an erased partition and no web
+    // UI - much worse than a refused upload.
+    const match = mainCpp.match(/recv_wait_timeout\s*=\s*(\d+)/);
+    expect(match).not.toBeNull();
+    expect(Number(match[1])).toBeGreaterThanOrEqual(15);
+  });
 });
 
 describe('Output-angle calibration firmware contract', () => {
