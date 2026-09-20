@@ -412,17 +412,129 @@ static esp_err_t get_coefficients_handler(httpd_req_t *req)
  *
  * Not expert-gated: it reports state and moves nothing.
  */
+/**
+ * GET/POST /api/calibration/camera-source - {"source": "<ip, host or url>"}
+ *
+ * Where to ask for an independent output-shaft angle. A bare host or IP
+ * becomes http://<host>/angle; anything starting with "http" is taken
+ * verbatim, which is what lets the same button run against a host-side
+ * service while the camera does not serve angles itself yet. Empty turns
+ * the feature off, which is the default.
+ *
+ * Expert-gated on write: it decides where the machine will take its
+ * correction from.
+ */
+static esp_err_t get_camera_source_handler(httpd_req_t *req)
+{
+    auto &cfg = Configuration::getInstance();
+    std::string source = cfg.getCameraAngleSource();
+    std::string url = cfg.getCameraAngleUrl();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "source", source.c_str());
+    cJSON_AddStringToObject(root, "url", url.c_str());
+    cJSON_AddBoolToObject(root, "configured", !url.empty());
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_camera_source_handler(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    cJSON *root = nullptr;
+    if (!parse_json_body(req, &root))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+    cJSON *item = cJSON_GetObjectItem(root, "source");
+    if (!cJSON_IsString(item))
+    {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected 'source' (string)");
+        return ESP_FAIL;
+    }
+    std::string source = item->valuestring;
+    cJSON_Delete(root);
+    if (source.size() > 190)
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "'source' is too long");
+        return ESP_FAIL;
+    }
+    Configuration::getInstance().setCameraAngleSource(source);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/**
+ * GET /api/calibration/camera/stream
+ *
+ * Runs the camera-referenced output-angle calibration, progress over SSE
+ * like the other two. Real motion over the whole travel and several minutes
+ * long, so the same client-gone handling applies: the run finishes and
+ * persists whatever it measured even if the browser goes away.
+ */
+static esp_err_t calibration_camera_stream(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+
+    char buf[256];
+    bool clientGone = false;
+    auto send_event = [&](const char *evt, const char *data)
+    {
+        if (clientGone)
+            return;
+        int len = snprintf(buf, sizeof(buf), "event: %s\ndata: %s\n\n", evt, data);
+        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
+        {
+            ESP_LOGW(TAG, "calibration/camera/stream: client gone, continuing");
+            clientGone = true;
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    };
+
+    auto result = RotatorHW::getInstance().calibrateOutputAngle(
+        [&](int pct)
+        {
+            char d[8];
+            snprintf(d, sizeof(d), "%d", pct);
+            send_event("progress", d);
+        });
+
+    char resultJson[224];
+    snprintf(resultJson, sizeof(resultJson),
+             "{\"positions\":%d,\"rmsBeforeMdeg\":%.1f,\"peakBeforeMdeg\":%.1f,"
+             "\"rmsAfterMdeg\":%.1f,\"stored\":%s}",
+             result.positions, result.rmsBeforeMdeg, result.peakBeforeMdeg,
+             result.rmsAfterMdeg, result.stored ? "true" : "false");
+    send_event("complete_camera", resultJson);
+    if (!clientGone)
+        httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
 static esp_err_t calibration_status_handler(httpd_req_t *req)
 {
     auto status = RotatorHW::getInstance().getCalibrationStatus();
     char buf[224];
     int len = snprintf(buf, sizeof(buf),
         "{\"generation\":%lu,\"kmax\":%d,\"zeroStale\":%s,"
-        "\"fullStepTableStale\":%s,\"zeroPosSensorValue\":%d,\"consistent\":%s}",
+        "\"fullStepTableStale\":%s,\"zeroPosSensorValue\":%d,"
+        "\"outputCorrection\":%s,\"consistent\":%s}",
         (unsigned long)status.generation, status.kmax,
         status.zeroStale ? "true" : "false",
         status.fullStepTableStale ? "true" : "false",
         (int)status.zeroPosSensorValue,
+        status.outputCorrection ? "true" : "false",
         (!status.zeroStale && !status.fullStepTableStale) ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, len);
@@ -1103,6 +1215,27 @@ void register_web_handles(httpd_handle_t server)
         .handler = position_goto_handler,
         .user_ctx = NULL};
     httpd_register_uri_handler(server, &position_goto);
+
+    httpd_uri_t camera_source_get = {
+        .uri = "/api/calibration/camera-source",
+        .method = HTTP_GET,
+        .handler = get_camera_source_handler,
+        .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &camera_source_get);
+
+    httpd_uri_t camera_source_set = {
+        .uri = "/api/calibration/camera-source",
+        .method = HTTP_POST,
+        .handler = set_camera_source_handler,
+        .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &camera_source_set);
+
+    httpd_uri_t camera_sse = {
+        .uri = "/api/calibration/camera/stream",
+        .method = HTTP_GET,
+        .handler = calibration_camera_stream,
+        .user_ctx = nullptr};
+    httpd_register_uri_handler(server, &camera_sse);
 
     httpd_uri_t calibration_status = {
         .uri = "/api/calibration/status",

@@ -125,8 +125,38 @@ public:
         bool zeroStale;
         bool fullStepTableStale;
         int16_t zeroPosSensorValue;
+        bool outputCorrection;
     };
     CalibrationStatus getCalibrationStatus() const;
+
+    // Highest harmonic of the output-revolution correction. Chosen from the
+    // bench campaign: the measured error has real content at 1-4 (the output
+    // stage), at 8, and at 10 and 20 (once and twice per motor revolution),
+    // so the model has to reach 20. Cross-validation on 200 targets is also
+    // clear that reaching further only overfits - orders 1..20 scored worse
+    // on held-out targets than a selected subset - which is why the run
+    // below insists on enough sample positions to support the fit.
+    static constexpr int OUTCAL_KMAX = 20;
+
+    // Result of a camera-referenced output-angle calibration.
+    struct OutputCalibrationResult
+    {
+        int positions;       // how many the run actually measured
+        double rmsBeforeMdeg;
+        double rmsAfterMdeg; // residual of the fit, in millidegrees of output
+        double peakBeforeMdeg;
+        bool stored;
+    };
+
+    // Measure what the AS5600 cannot see, against an external angle source,
+    // and store it as a correction over the output revolution. Needs
+    // Configuration::getCameraAngleUrl() to point at something.
+    OutputCalibrationResult calibrateOutputAngle(std::function<void(int)> onProgress);
+
+    // The correction, in output degrees, at a mechanical angle. Zero when
+    // nothing has been measured.
+    double outputAngleCorrection(double mechanicalDeg) const;
+    bool hasOutputCorrection() const { return _outCalValid; }
 
     // external accessors
     bool getIsMoving()
@@ -390,6 +420,19 @@ private:
     // Set at load when the stored zero carries a different calibration
     // generation than the correction in force - see the constructor.
     bool _zeroCalibrationStale = false;
+
+    // Camera-referenced correction over the output revolution: constant plus
+    // cos/sin for each harmonic. Loaded in the constructor, written by
+    // calibrateOutputAngle(). Stamped with the angle-calibration generation
+    // it was measured against, like the zero and the full-step table - it is
+    // expressed in terms of the sensor-derived angle, so it stops meaning
+    // anything when that changes.
+    bool _outCalValid = false;
+    double _outCalConst = 0.0;
+    double _outCalCos[OUTCAL_KMAX + 1] = {};
+    double _outCalSin[OUTCAL_KMAX + 1] = {};
+    bool loadOutputCalibration();
+    bool saveOutputCalibration();
 
     // Instantiate TMC2209
     TMC2209 stepper_driver;

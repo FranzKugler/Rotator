@@ -13,6 +13,7 @@ const nvsRoutes = readFileSync(new URL('../main/NvsRoutes.c', import.meta.url), 
 const logBuffer = readFileSync(new URL('../main/LogBuffer.c', import.meta.url), 'utf8');
 const configuration = readFileSync(new URL('../main/Configuration.cpp', import.meta.url), 'utf8');
 const rotatorHeader = readFileSync(new URL('../main/RotatorHW.h', import.meta.url), 'utf8');
+const cameraAngle = readFileSync(new URL('../main/CameraAngle.c', import.meta.url), 'utf8');
 
 describe('WLAN firmware contract', () => {
   it('provides current WLAN state and hostname endpoints', () => {
@@ -255,6 +256,93 @@ describe('Sensor calibration firmware contract', () => {
     expect(body).toContain('forwardStep()');
     expect(body).toContain('setMicrostepsPerStep(256)');
     expect(body).not.toContain('MOVE_WAIT');
+  });
+});
+
+describe('Output-angle calibration firmware contract', () => {
+  it('asks an external service for the angle instead of doing vision on the device', () => {
+    // The image processing belongs where the image already is. Doing it here
+    // would mean pulling a 270 KB JPEG over WiFi and decoding it into 1.9 MB
+    // of PSRAM to reach pixels another device already holds, plus the
+    // largest and least testable code in the project.
+    expect(cameraAngle).toContain('camera_angle_read');
+    expect(cameraAngle).toContain('esp_http_client_perform');
+    expect(webServer).toContain('"/api/calibration/camera-source"');
+    expect(webServer).toContain('"/api/calibration/camera/stream"');
+  });
+
+  it('bounds the TCP connect itself instead of trusting the client timeout', () => {
+    // esp_http_client's timeout governs the transaction, not the connect,
+    // and this build retransmits SYN twelve times. Against an address that
+    // silently drops packets one connect then takes minutes - live on
+    // 2026-09-19 that turned a 164-position run into hours during which the
+    // device answered nothing, because httpd serves every socket from the
+    // task the handler runs in.
+    expect(cameraAngle).toContain('host_reachable');
+    const fn = cameraAngle.slice(cameraAngle.indexOf('static bool host_reachable('));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    expect(body).toContain('O_NONBLOCK');
+    expect(body).toContain('select(');
+    const read = cameraAngle.slice(cameraAngle.indexOf('bool camera_angle_read('));
+    expect(read.slice(0, read.indexOf('\n}'))).toContain('host_reachable(url,');
+  });
+
+  it('treats any failure of the angle source as no measurement, never as zero', () => {
+    // A skipped position costs one sample. A zero treated as an angle poisons
+    // the fit for every position after it.
+    const fn = cameraAngle.slice(cameraAngle.indexOf('bool camera_angle_read('));
+    const client = fn.slice(0, fn.indexOf('\n}'));
+    for (const guard of ['status != 200', 'body.length == 0', 'end == body.buffer'])
+      expect(client).toContain(guard);
+    const run = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::calibrateOutputAngle('));
+    const body = run.slice(0, run.indexOf('\n}'));
+    expect(body).toContain('no angle at');
+    // And it stops rather than driving the whole travel to discover the
+    // source was never reachable - with progress counted per position
+    // attempted, so a dead source does not look like a hung run.
+    expect(body).toContain('GIVE_UP_AFTER');
+    const progressAt = body.indexOf('onProgress(');
+    const readAt = body.indexOf('camera_angle_read(');
+    expect(progressAt).toBeGreaterThan(0);
+    expect(progressAt).toBeLessThan(readAt);
+  });
+
+  it('refuses a correction that cannot be a gear error', () => {
+    // Most likely cause of a huge one is an angle source that counts the
+    // other way, which would make the "correction" roughly minus twice the
+    // angle and wreck every move afterwards.
+    const run = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::calibrateOutputAngle('));
+    const body = run.slice(0, run.indexOf('\n}'));
+    expect(body).toContain('SANITY_LIMIT_MDEG');
+    expect(body).toMatch(/rmsBeforeMdeg > SANITY_LIMIT_MDEG/);
+  });
+
+  it('measures through the normal commanded-move path, not a private one', () => {
+    // A correction measured with a different motion discipline than the one
+    // it will be used under - in particular without the one-sided approach -
+    // is a correction for a different machine.
+    const run = rotatorHW.slice(rotatorHW.indexOf('RotatorHW::calibrateOutputAngle('));
+    expect(run.slice(0, run.indexOf('\n}'))).toContain('putMechanicalPosition(target)');
+  });
+
+  it('feeds the correction forward onto the target only, never onto the reported position', () => {
+    // The closed loop drives the sensor, and the sensor cannot see the
+    // gearing. Correcting the reported position instead would make the loop
+    // chase its own correction.
+    for (const fnName of ['putAbsolutePosition', 'putMechanicalPosition']) {
+      const fn = rotatorHW.slice(rotatorHW.indexOf(`RotatorHW::${fnName}(`));
+      expect(fn.slice(0, fn.indexOf('\n}'))).toContain('outputAngleCorrection(');
+    }
+    for (const fnName of ['getPosition', 'getMechanicalPosition']) {
+      const fn = rotatorHW.slice(rotatorHW.indexOf(`RotatorHW::${fnName}(`));
+      expect(fn.slice(0, fn.indexOf('\n}'))).not.toContain('outputAngleCorrection(');
+    }
+  });
+
+  it('stamps the output correction with the sensor calibration it was measured against', () => {
+    expect(rotatorHW).toContain('OUTCAL_MAGIC');
+    const load = rotatorHW.slice(rotatorHW.indexOf('bool RotatorHW::loadOutputCalibration()'));
+    expect(load.slice(0, load.indexOf('\n}'))).toContain('calibrationGeneration()');
   });
 });
 

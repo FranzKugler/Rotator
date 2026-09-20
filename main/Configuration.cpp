@@ -73,7 +73,8 @@ Configuration::Configuration()
         "192.168.7.1",
         "255.255.255.0",
         {0x02, 0x02, 0x84, 0x6A, 0x96, 0x00},
-        true}; // nominalClockwise - matches this firmware's existing, already-calibrated convention
+        true,  // nominalClockwise - matches this firmware's existing, already-calibrated convention
+        ""};   // cameraAngleSource - off until someone points it at something
 
     if (!mountLittleFS())
     {
@@ -186,6 +187,8 @@ bool Configuration::load()
     // to true (this firmware's existing, already-calibrated convention).
     cJSON *nominalItem = cJSON_GetObjectItem(root, "nominalClockwise");
     _data.nominalClockwise = nominalItem ? cJSON_IsTrue(nominalItem) : true;
+    cJSON *cameraItem = cJSON_GetObjectItem(root, "cameraAngleSource");
+    _data.cameraAngleSource = (cameraItem && cJSON_IsString(cameraItem)) ? cameraItem->valuestring : "";
     unsigned int tmp[6];
     if (sscanf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
                &tmp[0], &tmp[1], &tmp[2], &tmp[3], &tmp[4], &tmp[5]) == 6)
@@ -419,6 +422,7 @@ bool Configuration::save() const
             _data.macAddress[3], _data.macAddress[4], _data.macAddress[5]);
     cJSON_AddStringToObject(root, "macAddress", macStr);
     cJSON_AddBoolToObject(root, "nominalClockwise", _data.nominalClockwise);
+    cJSON_AddStringToObject(root, "cameraAngleSource", _data.cameraAngleSource.c_str());
 
     char *str = cJSON_Print(root);
     ESP_LOGI("cfg", "JSON string = %s", str);
@@ -553,6 +557,32 @@ void Configuration::setNominalClockwise(bool clockwise)
         _data.nominalClockwise = clockwise;
     }
     save();
+}
+
+std::string Configuration::getCameraAngleSource() const
+{
+    std::lock_guard<std::mutex> lock(_mtx);
+    return _data.cameraAngleSource;
+}
+
+void Configuration::setCameraAngleSource(const std::string &source)
+{
+    {
+        std::lock_guard<std::mutex> lock(_mtx);
+        _data.cameraAngleSource = source;
+    }
+    save();
+}
+
+std::string Configuration::getCameraAngleUrl() const
+{
+    std::lock_guard<std::mutex> lock(_mtx);
+    const std::string &s = _data.cameraAngleSource;
+    if (s.empty())
+        return "";
+    if (s.rfind("http", 0) == 0)
+        return s;
+    return "http://" + s + "/angle";
 }
 
 void Configuration::getFullStepTable(float outTable[N_STEPS]) const

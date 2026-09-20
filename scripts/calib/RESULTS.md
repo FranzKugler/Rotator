@@ -321,6 +321,42 @@ and it had never been re-derived. Measured properly it is **780** - so the
 machine's absolute zero moves by 6.6 degrees, and every Alpaca position it
 reported before this was offset by that much.
 
+## The device can now run the output calibration itself
+
+As of v0.11.0 there is a button for it, and a field for the address to ask.
+The split is deliberate: the rotator knows how to move, fit and store; it
+does no image processing at all and just GETs a number from
+`Configuration::getCameraAngleSource()`.
+
+That is not squeamishness about the work. Putting the vision on the rotator
+would mean pulling a 270 KB JPEG over WiFi and decoding it into 1.9 MB of
+PSRAM to reach pixels another device already holds, plus a chessboard
+detector - the largest and least testable code in the project. Memory and
+flash would have been fine (tjpgd is in the ESP32-S3 ROM, 600 KB of app
+partition free, 8.26 MB of contiguous PSRAM); the detector is the problem.
+Template matching was tried as a substitute on 71 already-captured frames
+and measured 1679 mdeg rms against the chessboard pipeline - 460 times too
+coarse - so it is not the easy way out it looks like.
+
+`scripts/calib/angle_service.py` answers the question today, with the same
+homography-ratio estimator as the rest of the campaign; RotatorCam should
+answer it eventually, since it already has the frame.
+
+The correction is fed forward onto the commanded angle only, never onto the
+reported position - the loop drives the sensor, and the sensor cannot see
+the gearing, so correcting what it reads would make it chase itself. It is
+stamped with the sensor-calibration generation like the zero and the
+full-step table, and dropped if that changes.
+
+Two things the first live run taught, both fixed: progress has to count
+positions *attempted*, or a run against an unreachable source is
+indistinguishable from a hung one; and the run has to give up after a few
+failures in a row, because an address that silently drops packets turns 164
+positions into 164 timeouts - an hour during which the device answers
+nothing at all. That last part is worth knowing in general: all three
+calibration routines block the HTTP server for their whole duration, since
+ESP-IDF's httpd serves every socket from one task.
+
 ## Answering the original question
 
 A user with a fresh unit, calibrating without a camera, can correct the

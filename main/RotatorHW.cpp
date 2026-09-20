@@ -1,4 +1,5 @@
 #include "RotatorHW.h"
+#include "CameraAngle.h"
 #include "Configuration.hpp"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -194,6 +195,8 @@ RotatorHW::RotatorHW()
     // 2026-09-08 that made the old hardcoded 27 stop matching the real
     // window at all) - now loaded from NVS, falling back to 27 (that last
     // hand-measured value) only if nothing has been calibrated yet.
+    loadOutputCalibration();
+
     _zeroPosSensorValue = 27;
     _zeroPosSensorOffset = 27.0;
     {
@@ -608,11 +611,305 @@ int RotatorHW::measureMechanicalZero(std::function<void(int)> onProgress)
     return sensorMechanicalZeroPosition;
 }
 
+// --- camera-referenced correction over the output revolution -------------
+//
+// Stored in its own NVS blob rather than alongside the Fourier coefficients:
+// it is measured against a different reference (an external view of the
+// output shaft, not the motor's own steps), it can be absent on a device
+// that has no camera, and it has its own natural lifetime. Like the zero and
+// the full-step table it carries the angle-calibration generation it was
+// measured against, because it is expressed in terms of the sensor-derived
+// angle and stops meaning anything when that changes.
+namespace {
+constexpr uint32_t OUTCAL_MAGIC = 0x4F434C31; // "OCL1"
+constexpr uint16_t OUTCAL_VERSION = 1;
+
+struct OutCalBlob
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kmax;
+    uint32_t generation;
+    double constant;
+    double cosCoeff[RotatorHW::OUTCAL_KMAX + 1];
+    double sinCoeff[RotatorHW::OUTCAL_KMAX + 1];
+};
+} // namespace
+
+bool RotatorHW::loadOutputCalibration()
+{
+    _outCalValid = false;
+    nvs_handle_t nvs;
+    if (nvs_open("outcal", NVS_READONLY, &nvs) != ESP_OK)
+        return false;
+    OutCalBlob blob;
+    size_t size = sizeof(blob);
+    esp_err_t err = nvs_get_blob(nvs, "coeffs", &blob, &size);
+    nvs_close(nvs);
+    if (err != ESP_OK || size != sizeof(blob) || blob.magic != OUTCAL_MAGIC ||
+        blob.version != OUTCAL_VERSION || blob.kmax != OUTCAL_KMAX)
+        return false;
+
+    uint32_t current = Configuration::getInstance().calibrationGeneration();
+    if (blob.generation != current)
+    {
+        ESP_LOGW(TAG, "Output-angle correction was measured against calibration generation %lu "
+                      "but the sensor correction is generation %lu - dropped, re-measure it",
+                 (unsigned long)blob.generation, (unsigned long)current);
+        return false;
+    }
+    _outCalConst = blob.constant;
+    for (int k = 0; k <= OUTCAL_KMAX; ++k)
+    {
+        _outCalCos[k] = blob.cosCoeff[k];
+        _outCalSin[k] = blob.sinCoeff[k];
+    }
+    _outCalValid = true;
+    ESP_LOGI(TAG, "Output-angle correction loaded (generation %lu)", (unsigned long)blob.generation);
+    return true;
+}
+
+bool RotatorHW::saveOutputCalibration()
+{
+    nvs_handle_t nvs;
+    if (nvs_open("outcal", NVS_READWRITE, &nvs) != ESP_OK)
+        return false;
+    OutCalBlob blob;
+    blob.magic = OUTCAL_MAGIC;
+    blob.version = OUTCAL_VERSION;
+    blob.kmax = OUTCAL_KMAX;
+    blob.generation = Configuration::getInstance().calibrationGeneration();
+    blob.constant = _outCalConst;
+    for (int k = 0; k <= OUTCAL_KMAX; ++k)
+    {
+        blob.cosCoeff[k] = _outCalCos[k];
+        blob.sinCoeff[k] = _outCalSin[k];
+    }
+    esp_err_t err = nvs_set_blob(nvs, "coeffs", &blob, sizeof(blob));
+    if (err == ESP_OK)
+        err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+double RotatorHW::outputAngleCorrection(double mechanicalDeg) const
+{
+    if (!_outCalValid)
+        return 0.0;
+    double phase = mechanicalDeg * M_PI / 180.0;
+    double value = _outCalConst;
+    for (int k = 1; k <= OUTCAL_KMAX; ++k)
+        value += _outCalCos[k] * cos(k * phase) + _outCalSin[k] * sin(k * phase);
+    return value;
+}
+
+RotatorHW::OutputCalibrationResult RotatorHW::calibrateOutputAngle(std::function<void(int)> onProgress)
+{
+    // Enough positions to support the fit with room to spare. 2*KMAX+1 = 41
+    // unknowns, and cross-validation on the bench was unambiguous that a
+    // model this size overfits when the samples only just outnumber it, so
+    // the run takes four times as many.
+    constexpr int TERMS = 2 * OUTCAL_KMAX + 1;
+    constexpr int POSITIONS = 4 * TERMS;          // 164
+    constexpr double SPAN_DEG = 350.0;            // inside the +/-190 cable limit
+    constexpr int ANGLE_TIMEOUT_MS = 15000;
+    constexpr int SETTLE_MS = 600;
+
+    OutputCalibrationResult result = {0, 0.0, 0.0, 0.0, false};
+
+    std::string url = Configuration::getInstance().getCameraAngleUrl();
+    if (url.empty())
+    {
+        ESP_LOGW(TAG, "No angle source configured - nothing to calibrate against");
+        return result;
+    }
+
+    std::vector<double> mech;
+    std::vector<double> delta; // external angle minus sensor-derived, in degrees
+    mech.reserve(POSITIONS);
+    delta.reserve(POSITIONS);
+
+    double reference = 0.0;
+    bool haveReference = false;
+    int consecutiveFailures = 0;
+    constexpr int GIVE_UP_AFTER = 5;
+
+    for (int i = 0; i < POSITIONS; i++)
+    {
+        double target = -SPAN_DEG / 2.0 + SPAN_DEG * i / (double)(POSITIONS - 1);
+        // Through the normal commanded-move path, so the one-sided approach
+        // applies. A correction measured with a different motion discipline
+        // than the one it will be used under is a correction for a different
+        // machine.
+        if (!putMechanicalPosition(target))
+        {
+            ESP_LOGW(TAG, "Output calibration: %f deg refused, skipping", target);
+            continue;
+        }
+        vTaskDelay(SETTLE_MS / portTICK_PERIOD_MS);
+
+        // Progress counts positions *attempted*, not positions that yielded
+        // an angle - otherwise a run against an unreachable source is
+        // indistinguishable from a hung one for its whole twenty minutes.
+        onProgress(100 * (i + 1) / POSITIONS);
+
+        double external = 0.0;
+        if (!camera_angle_read(url.c_str(), &external, ANGLE_TIMEOUT_MS))
+        {
+            ESP_LOGW(TAG, "Output calibration: no angle at %f deg, skipping", target);
+            consecutiveFailures++;
+            // Grinding through the whole travel to find out the angle source
+            // was never there wastes twenty minutes and a lot of travel. A
+            // few in a row at the start means it is not coming.
+            if (mech.empty() && consecutiveFailures >= GIVE_UP_AFTER)
+            {
+                ESP_LOGE(TAG, "Output calibration: %d positions in a row with no angle from %s "
+                              "- giving up. Check that the source is reachable from the rotator "
+                              "and answers with a number.",
+                         consecutiveFailures, url.c_str());
+                break;
+            }
+            continue;
+        }
+        consecutiveFailures = 0;
+        double here = getMechanicalPosition();
+        if (!haveReference)
+        {
+            reference = external - here;
+            haveReference = true;
+        }
+        double d = (external - here) - reference;
+        d -= 360.0 * std::round(d / 360.0);
+        mech.push_back(here);
+        delta.push_back(d);
+    }
+
+    result.positions = (int)mech.size();
+    if (result.positions < 2 * TERMS)
+    {
+        ESP_LOGE(TAG, "Output calibration: only %d usable positions, need %d - not stored",
+                 result.positions, 2 * TERMS);
+        return result;
+    }
+
+    double mean = 0.0;
+    for (double d : delta) mean += d;
+    mean /= (double)delta.size();
+    double sumSq = 0.0, peak = 0.0;
+    for (double d : delta)
+    {
+        double e = d - mean;
+        sumSq += e * e;
+        peak = std::max(peak, std::fabs(e));
+    }
+    result.rmsBeforeMdeg = std::sqrt(sumSq / delta.size()) * 1000.0;
+    result.peakBeforeMdeg = peak * 1000.0;
+
+    // A sanity gate, not a tuning knob. What this measures should be tens of
+    // millidegrees; degrees means the angle source disagrees with this
+    // machine about something basic - most likely which way is positive, in
+    // which case the "correction" would be roughly minus twice the angle and
+    // would wreck every move made afterwards. Refusing to store it is the
+    // only safe answer, and the number is reported so the cause is visible.
+    constexpr double SANITY_LIMIT_MDEG = 5000.0;
+    if (result.rmsBeforeMdeg > SANITY_LIMIT_MDEG)
+    {
+        ESP_LOGE(TAG, "Output calibration: the angle source differs from this machine by "
+                      "%.0f mdeg rms - far too much to be a gear correction. Check that it "
+                      "reports output degrees with the same sign. Not stored.",
+                 result.rmsBeforeMdeg);
+        return result;
+    }
+
+    // Same least-squares machinery as the sensor fit, over harmonics of the
+    // output revolution instead of the sensor's.
+    std::vector<double> ata(TERMS * TERMS, 0.0);
+    std::vector<double> atb(TERMS, 0.0);
+    std::vector<double> basis(TERMS);
+    for (size_t n = 0; n < mech.size(); n++)
+    {
+        double phase = mech[n] * M_PI / 180.0;
+        basis[0] = 1.0;
+        for (int k = 1; k <= OUTCAL_KMAX; ++k)
+        {
+            basis[2 * k - 1] = cos(k * phase);
+            basis[2 * k] = sin(k * phase);
+        }
+        for (int i = 0; i < TERMS; ++i)
+        {
+            atb[i] += basis[i] * delta[n];
+            for (int j = 0; j < TERMS; ++j)
+                ata[i * TERMS + j] += basis[i] * basis[j];
+        }
+    }
+    std::vector<double> m((size_t)TERMS * (TERMS + 1));
+    for (int i = 0; i < TERMS; ++i)
+    {
+        for (int j = 0; j < TERMS; ++j)
+            m[i * (TERMS + 1) + j] = ata[i * TERMS + j];
+        m[i * (TERMS + 1) + TERMS] = atb[i];
+    }
+    for (int col = 0; col < TERMS; ++col)
+    {
+        int pivot = col;
+        for (int r = col + 1; r < TERMS; ++r)
+            if (std::fabs(m[r * (TERMS + 1) + col]) > std::fabs(m[pivot * (TERMS + 1) + col]))
+                pivot = r;
+        if (std::fabs(m[pivot * (TERMS + 1) + col]) < 1e-9)
+        {
+            ESP_LOGE(TAG, "Output calibration: fit is singular - not stored");
+            return result;
+        }
+        if (pivot != col)
+            for (int j = col; j <= TERMS; ++j)
+                std::swap(m[col * (TERMS + 1) + j], m[pivot * (TERMS + 1) + j]);
+        for (int r = col + 1; r < TERMS; ++r)
+        {
+            double f = m[r * (TERMS + 1) + col] / m[col * (TERMS + 1) + col];
+            for (int j = col; j <= TERMS; ++j)
+                m[r * (TERMS + 1) + j] -= f * m[col * (TERMS + 1) + j];
+        }
+    }
+    std::vector<double> x(TERMS);
+    for (int i = TERMS - 1; i >= 0; --i)
+    {
+        double sum = m[i * (TERMS + 1) + TERMS];
+        for (int j = i + 1; j < TERMS; ++j)
+            sum -= m[i * (TERMS + 1) + j] * x[j];
+        x[i] = sum / m[i * (TERMS + 1) + i];
+    }
+
+    _outCalConst = x[0];
+    for (int k = 1; k <= OUTCAL_KMAX; ++k)
+    {
+        _outCalCos[k] = x[2 * k - 1];
+        _outCalSin[k] = x[2 * k];
+    }
+    _outCalCos[0] = 0.0;
+    _outCalSin[0] = 0.0;
+    _outCalValid = true;
+
+    double residSq = 0.0;
+    for (size_t n = 0; n < mech.size(); n++)
+    {
+        double e = delta[n] - outputAngleCorrection(mech[n]);
+        residSq += e * e;
+    }
+    result.rmsAfterMdeg = std::sqrt(residSq / mech.size()) * 1000.0;
+    result.stored = saveOutputCalibration();
+
+    ESP_LOGI(TAG, "Output-angle calibration over %d positions: %.1f mdeg rms before "
+                  "(peak %.1f), %.1f mdeg residual after, stored=%s",
+             result.positions, result.rmsBeforeMdeg, result.peakBeforeMdeg,
+             result.rmsAfterMdeg, result.stored ? "yes" : "no");
+    return result;
+}
+
 RotatorHW::CalibrationStatus RotatorHW::getCalibrationStatus() const
 {
     auto &cfg = Configuration::getInstance();
     return {cfg.calibrationGeneration(), KMAX, _zeroCalibrationStale,
-            cfg.fullStepTableStale(), _zeroPosSensorValue};
+            cfg.fullStepTableStale(), _zeroPosSensorValue, _outCalValid};
 }
 
 void RotatorHW::setZeroPosSensorValue(int value)
@@ -1613,6 +1910,13 @@ bool RotatorHW::putRelativePosition(double position)
     double newTargetPosition = FMOD360(getPosition() + position);
     double desiredMechDeg = FMOD360(dir * (newTargetPosition - positionOffsetToMechanicalPosition));
     long targetMotorPosition;
+    // Feed-forward the camera-referenced correction onto the target: the
+    // closed loop drives the *sensor* to where it is told, and the sensor
+    // cannot see the gearing, so asking it for (target - g(target)) is the
+    // only way the output shaft ends up at target. Applied to the commanded
+    // angle only - the position getters keep reporting the sensor-derived
+    // angle, or the loop would chase its own correction.
+    desiredMechDeg = FMOD360(desiredMechDeg - outputAngleCorrection(desiredMechDeg));
     if (!legalMotorStepsForAngle(desiredMechDeg, &targetMotorPosition))
     {
         ESP_LOGW(TAG, "Refusing relative move by %f deg: would reach %f deg from mechanical zero, outside +/-%.0f deg cable limit",
@@ -1643,6 +1947,13 @@ bool RotatorHW::putAbsolutePosition(double position)
     double newTargetPosition = FMOD360(position);
     double desiredMechDeg = FMOD360(dir * (newTargetPosition - positionOffsetToMechanicalPosition));
     long targetMotorPosition;
+    // Feed-forward the camera-referenced correction onto the target: the
+    // closed loop drives the *sensor* to where it is told, and the sensor
+    // cannot see the gearing, so asking it for (target - g(target)) is the
+    // only way the output shaft ends up at target. Applied to the commanded
+    // angle only - the position getters keep reporting the sensor-derived
+    // angle, or the loop would chase its own correction.
+    desiredMechDeg = FMOD360(desiredMechDeg - outputAngleCorrection(desiredMechDeg));
     if (!legalMotorStepsForAngle(desiredMechDeg, &targetMotorPosition))
     {
         ESP_LOGW(TAG, "Refusing MoveAbsolute to %f deg: would reach %f deg from mechanical zero, outside +/-%.0f deg cable limit",
@@ -1671,7 +1982,15 @@ bool RotatorHW::putMechanicalPosition(double position)
     // MoveMechanical's argument is already a wrapped mechanical angle - no
     // dir/offset transform needed to find the motor target itself.
     long targetMotorPosition;
-    if (!legalMotorStepsForAngle(FMOD360(position), &targetMotorPosition))
+    // Feed-forward the camera-referenced correction onto the target: the
+    // closed loop drives the *sensor* to where it is told, and the sensor
+    // cannot see the gearing, so asking it for (target - g(target)) is the
+    // only way the output shaft ends up at target. Applied to the commanded
+    // angle only - the position getters keep reporting the sensor-derived
+    // angle, or the loop would chase its own correction.
+    const double correctedMechDeg =
+        FMOD360(FMOD360(position) - outputAngleCorrection(FMOD360(position)));
+    if (!legalMotorStepsForAngle(correctedMechDeg, &targetMotorPosition))
     {
         ESP_LOGW(TAG, "Refusing MoveMechanical to %f deg: would reach %f deg from mechanical zero, outside +/-%.0f deg cable limit",
                  position, targetMotorPosition * DEGREE_PER_STEP, MOTION_LIMIT_DEG);

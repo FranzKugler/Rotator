@@ -25,6 +25,15 @@ struct ConfigData {
     // lives here rather than in NVS alongside the angle-sensor calibration.
     bool nominalClockwise;
 
+    // Where to ask for an independent output-shaft angle, for the
+    // camera-referenced calibration. Empty means the feature is off, which
+    // is the default and the only state a device without a camera is ever
+    // in. A bare host or IP becomes http://<host>/angle; anything starting
+    // with "http" is used verbatim, which is what lets the same button run
+    // against a host-side service while RotatorCam does not serve angles
+    // itself yet.
+    std::string cameraAngleSource;
+
     // Full-step-resolution residual correction, layered on top of C0/A/B -
     // see RotatorHW::setFullStepTable()'s comment. All-zero (a no-op) until
     // a camera-referenced fit has been uploaded. Appended last (not grouped
@@ -64,6 +73,13 @@ public:
     // Nominal rotation direction - see ConfigData::nominalClockwise.
     bool getNominalClockwise() const;
     void setNominalClockwise(bool clockwise);
+
+    // Independent angle source - see ConfigData::cameraAngleSource.
+    std::string getCameraAngleSource() const;
+    void setCameraAngleSource(const std::string &source);
+    // The full URL to GET, derived from the setting above. Empty when the
+    // feature is off.
+    std::string getCameraAngleUrl() const;
 
     // Full-step correction table - see ConfigData::fullStepTable.
     void getFullStepTable(float outTable[N_STEPS]) const;

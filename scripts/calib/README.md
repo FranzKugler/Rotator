@@ -33,6 +33,7 @@ everything downstream cannot be seen by it at all.
 | 8b | `log_tail.py` | drains the device's /log ring buffer, which wraps in ~30 s |
 | 9 | `capture_frames.py --mode alpaca` + `measure_frames.py` | the end-to-end test run |
 | 10 | `error_budget.py` | splits that run into loop / backlash / gear shape, cross-validated |
+| 10b | `angle_service.py` | serves the output-shaft angle over HTTP, so the device can calibrate against it by itself |
 | 11 | `plot_validation.py` | the test-run graph |
 
 `rotator_io.py`, `board.py`, `camera_model.py`, `gear_model.py` and
@@ -69,6 +70,30 @@ to f = 8000 px while still reproducing corners to 0.29 px. This is not a
 problem to solve - a board that stays in one fixed plane is the easy case,
 and the homography-ratio estimator in `measure_frames.py` never needs a
 focal length. `fit_camera.py` is kept for the diagnosis, not for production.
+
+## Letting the device calibrate itself against the camera
+
+The firmware can run the output-angle calibration on its own - a button in
+the web UI, `GET /api/calibration/camera/stream` underneath - but it does no
+image processing. It asks an HTTP address for a number. `angle_service.py`
+is what answers, until RotatorCam serves angles itself:
+
+    python3 scripts/calib/angle_service.py --camera 172.22.102.226 --port 8080
+
+Then set the device's angle source (web UI, or POST
+`/api/calibration/camera-source`) to `http://<that host>:8080/angle` and
+press the button.
+
+**It has to be reachable from the rotator, which the dev container is not.**
+The container sits on a Docker bridge (172.23.0.0/16) that the rotator's
+network does not route to, and `compose.yaml` publishes only the Vite port,
+bound to localhost. Run the service on the host instead - it needs numpy and
+opencv, the same throwaway venv as the rest of the analysis - or publish a
+port from the container deliberately.
+
+If the sign comes out inverted the device will refuse the result rather than
+store it: a correction that big cannot be a gear error, and it says so.
+Re-run the service with `--invert`.
 
 ## Environments
 

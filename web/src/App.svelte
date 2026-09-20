@@ -6,7 +6,8 @@
   import Storage from './sections/Storage.svelte';
   import Expert from './sections/Expert.svelte';
   import {
-    calibrationStream, connectAngles, fetchExpertStatus, fetchNominalDirection, gotoPosition,
+    calibrationStream, connectAngles, fetchCalibrationStatus, fetchCameraSource,
+    fetchExpertStatus, fetchNominalDirection, gotoPosition, setCameraSource,
     postJson, requestJson, setNominalDirection
   } from './lib/api.js';
 
@@ -47,6 +48,10 @@
   let scanBusy = $state(false);
   let zeroProgress = $state(null);
   let angleProgress = $state(null);
+  let cameraProgress = $state(null);
+  let cameraSource = $state('');
+  let cameraConfigured = $state(false);
+  let calibrationStatus = $state(null);
   let rawSensor = $state(0);
   let correctedSensor = $state(0);
   let stepPosition = $state(0);
@@ -206,38 +211,82 @@
     return 1;
   }
 
+  const setProgress = (kind, value) => {
+    if (kind === 'zero') zeroProgress = value;
+    else if (kind === 'angle') angleProgress = value;
+    else cameraProgress = value;
+  };
+
   function calibrate(path, completeEvent, kind) {
-    if (kind === 'zero') zeroProgress = 0; else angleProgress = 0;
+    setProgress(kind, 0);
     calibrationStream(path, completeEvent, {
-      progress(value) { if (kind === 'zero') zeroProgress = value; else angleProgress = value; },
+      progress(value) { setProgress(kind, value); },
       complete(value) {
+        setProgress(kind, null);
         if (kind === 'zero') {
-          zeroProgress = null;
           announce(`Mechanical zero: ${value}`);
+          loadCalibrationStatus();
           return;
         }
-        angleProgress = null;
+        if (kind === 'camera') {
+          try {
+            const result = JSON.parse(value);
+            announce(result.stored
+              ? `Output angle calibrated over ${result.positions} positions · ` +
+                `${result.rmsBeforeMdeg.toFixed(0)} mdeg RMS before, ` +
+                `${result.rmsAfterMdeg.toFixed(0)} mdeg left`
+              : `Output calibration not stored — ${result.positions} usable positions, ` +
+                `${result.rmsBeforeMdeg.toFixed(0)} mdeg RMS measured`, !result.stored);
+          } catch {
+            announce('Output angle calibration finished');
+          }
+          loadCalibrationStatus();
+          return;
+        }
         try {
           const result = JSON.parse(value);
           announce(
             `Angle sensor calibrated · residual ${result.residualAfterDeg.toFixed(3)}° RMS ` +
-            `(was ${result.residualBeforeDeg.toFixed(3)}°, peak ${result.peakAfterDeg.toFixed(3)}°)`
+            `(was ${result.residualBeforeDeg.toFixed(3)}°, closure ${result.closureCounts.toFixed(2)} counts)`
           );
         } catch {
           announce('Angle sensor calibrated');
         }
+        loadCalibrationStatus();
       },
       error() {
-        if (kind === 'zero') zeroProgress = null; else angleProgress = null;
+        setProgress(kind, null);
         announce('Calibration connection closed', true);
       }
     });
+  }
+
+  async function loadCameraSource() {
+    try {
+      const next = await fetchCameraSource();
+      cameraSource = next.source ?? '';
+      cameraConfigured = Boolean(next.configured);
+    } catch { /* leaves the field empty, which reads as "not set up" */ }
+  }
+
+  async function loadCalibrationStatus() {
+    try { calibrationStatus = await fetchCalibrationStatus(); } catch { calibrationStatus = null; }
+  }
+
+  async function saveCameraSource() {
+    try {
+      await setCameraSource(cameraSource.trim());
+      await loadCameraSource();
+      announce(cameraConfigured ? `Angle source: ${cameraSource.trim()}` : 'Angle source cleared');
+    } catch (reason) { announce(`Could not save the angle source: ${reason.message}`, true); }
   }
 
   onMount(() => {
     loadNetwork();
     loadWifiStatus();
     loadNominalDirection();
+    loadCameraSource();
+    loadCalibrationStatus();
     fetchExpertStatus().then((next) => (expert = next)).catch(() => {
       // Not fatal, and not a reason to unlock anything: the default above
       // already says locked.
@@ -390,6 +439,46 @@
         <div><h3>Find mechanical zero</h3><p class="hint">Searches the Hall-sensor index and measures its centre.</p><button class="primary" disabled={zeroProgress !== null} onclick={() => calibrate('/api/calibration/zero/stream', 'complete_zero', 'zero')}>Find zero</button>{#if zeroProgress !== null}<div class="progress"><div class="bar" style="width: {zeroProgress}%"></div></div><p class="hint">{zeroProgress}%</p>{/if}</div>
         <div><h3>Calibrate angle sensor</h3><p class="hint">Measures the AS5600 error over a full calibration sequence.</p><button class="primary" disabled={angleProgress !== null} onclick={() => calibrate('/api/calibration/angle/stream', 'complete_angle', 'angle')}>Calibrate sensor</button>{#if angleProgress !== null}<div class="progress"><div class="bar" style="width: {angleProgress}%"></div></div><p class="hint">{angleProgress}%</p>{/if}</div>
       </div>
+      {#if calibrationStatus && !calibrationStatus.consistent}
+        <p class="banner warning">
+          The stored {calibrationStatus.zeroStale ? 'mechanical zero' : 'full-step table'} was
+          measured against an older sensor calibration. Re-measure it, or absolute positions stay offset.
+        </p>
+      {/if}
+    </section>
+
+    <section class="card">
+      <h2>Output angle</h2>
+      <p class="hint">
+        The AS5600 sits on the motor shaft, ahead of the reduction, so it cannot see what the
+        gearing adds — measured at about 36 mdeg RMS on this machine. Correcting it needs
+        something that watches the output shaft. Give it the camera's address, or the address
+        of a service that answers with an angle.
+      </p>
+      <div class="field">
+        <label for="camera-source">Angle source</label>
+        <input id="camera-source" type="text" bind:value={cameraSource}
+               placeholder="172.22.102.226 or http://host:8080/angle" />
+        <p class="hint">A bare address becomes <code>http://…/angle</code>. Leave empty to turn this off.</p>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" onclick={saveCameraSource}>Save address</button>
+        <button type="button" class="primary" disabled={!cameraConfigured || cameraProgress !== null}
+                onclick={() => calibrate('/api/calibration/camera/stream', 'complete_camera', 'camera')}>
+          Calibrate output angle
+        </button>
+      </div>
+      {#if cameraProgress !== null}
+        <div class="progress"><div class="bar" style="width: {cameraProgress}%"></div></div>
+        <p class="hint">{cameraProgress}% · drives the whole travel, about half an hour. Stops early if the angle source does not answer.</p>
+      {/if}
+      {#if calibrationStatus}
+        <p class="hint">
+          {calibrationStatus.outputCorrection
+            ? 'An output-angle correction is stored and being applied.'
+            : 'No output-angle correction stored — commanded angles are uncorrected for the gearing.'}
+        </p>
+      {/if}
     </section>
   {:else if active === 'Update'}
     <Firmware />
@@ -420,6 +509,7 @@
   .network-fields input { width: 100%; }
   code { color: var(--accent); }
   .calibration-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: .75rem; }
   .calibration-actions > div + div { border-left: 1px solid var(--border); padding-left: 1.5rem; }
   .calibration-actions h3 { margin: 0 0 .25rem; font-size: 1rem; }
   .progress { height: 10px; margin: .75rem 0 .25rem; border-radius: 999px; background: var(--border); overflow: hidden; }
@@ -430,6 +520,7 @@
   footer { color: var(--muted); padding: .5rem .1rem 1rem; font-size: .75rem; }
   @media (max-width: 40rem) {
     .position, .calibration-actions { grid-template-columns: 1fr; }
+    .actions > button { flex: 1 1 100%; }
     .calibration-actions > div + div { border-left: 0; border-top: 1px solid var(--border); padding: 1rem 0 0; }
     .field { align-items: stretch; flex-wrap: wrap; }
     .field > input { flex-basis: 100%; }

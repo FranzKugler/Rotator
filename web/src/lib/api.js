@@ -55,6 +55,18 @@ export function setNominalDirection(clockwise, fetcher = fetch) {
   return postJson('/api/calibration/nominal-direction', { clockwise }, fetcher);
 }
 
+export function fetchCameraSource(fetcher = fetch) {
+  return requestJson('/api/calibration/camera-source', fetcher);
+}
+
+export function setCameraSource(source, fetcher = fetch) {
+  return postJson('/api/calibration/camera-source', { source }, fetcher);
+}
+
+export function fetchCalibrationStatus(fetcher = fetch) {
+  return requestJson('/api/calibration/status', fetcher);
+}
+
 export function gotoPosition(position, fetcher = fetch) {
   return postJson('/api/position/goto', { position }, fetcher);
 }
