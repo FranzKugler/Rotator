@@ -146,6 +146,14 @@ extern "C" void app_main(void)
     // headroom, not just enough for today's count.
     http_cfg.max_uri_handlers = 96;
     http_cfg.stack_size = 16384;
+    // A calibration run now hands its request to a worker task and keeps the
+    // socket for the whole run - over half an hour for the output-angle one.
+    // Without LRU purging, a couple of abandoned browser tabs on top of that
+    // fill max_open_sockets and the server stops accepting anything at all.
+    // Safe alongside the async handover: httpd_sess.c's lowest-LRU search
+    // explicitly skips sessions marked for_async_req, so the run's own
+    // socket is never the one reclaimed.
+    http_cfg.lru_purge_enable = true;
     httpd_handle_t server = nullptr;
     ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));
 

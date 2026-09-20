@@ -317,9 +317,16 @@ but still used, since dropping it would leave homing with nothing.
 
 Running this on the device turned up one more thing. Its stored mechanical
 zero was **27**, the hand-measured constant that predates any calibration,
-and it had never been re-derived. Measured properly it is **780** - so the
-machine's absolute zero moves by 6.6 degrees, and every Alpaca position it
-reported before this was offset by that much.
+and it had never been re-derived. Measured properly it is **581** - so the
+machine's absolute zero moves by about 4.9 degrees, and every Alpaca
+position it reported before this was offset by that much.
+
+One loose end there: the first run of that measurement returned 780 and
+every run since has returned 581, three times bit-identical, with homing
+landing on 578.3 against a target of 578. The weight of evidence is with
+581 and the machine is self-consistent on it, but the single 780 is
+unexplained - worth a second look before trusting the absolute zero to
+better than a degree.
 
 ## The device can now run the output calibration itself
 
@@ -352,10 +359,18 @@ Two things the first live run taught, both fixed: progress has to count
 positions *attempted*, or a run against an unreachable source is
 indistinguishable from a hung one; and the run has to give up after a few
 failures in a row, because an address that silently drops packets turns 164
-positions into 164 timeouts - an hour during which the device answers
-nothing at all. That last part is worth knowing in general: all three
-calibration routines block the HTTP server for their whole duration, since
-ESP-IDF's httpd serves every socket from one task.
+positions into 164 timeouts.
+
+That run also exposed something older and worse. All three calibration
+routines used to block the HTTP server for their whole duration - ESP-IDF's
+httpd serves every socket from one task, and an SSE handler that streams
+progress for half an hour holds it. Not just its own connection: the status
+endpoint, the Alpaca routes, everything. As of v0.12.0 the request is handed
+to a worker with `httpd_req_async_handler_begin()`, so the handler returns
+at once and the server goes back to its select loop; the wire protocol is
+unchanged. Measured on the device: **12 of 12 status probes answered in
+94-193 ms while a calibration was running**, where before it answered
+nothing at all.
 
 ## Answering the original question
 

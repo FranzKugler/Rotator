@@ -259,6 +259,46 @@ describe('Sensor calibration firmware contract', () => {
   });
 });
 
+describe('Calibration runs off the HTTP server task', () => {
+  it('hands the request to a worker instead of streaming from the server task', () => {
+    // ESP-IDF's httpd serves every socket from one task, so a handler that
+    // streams progress for minutes stops the whole server answering - not
+    // just its own connection. Live on 2026-09-19 a run pointed at an
+    // unreachable angle source took the device off the network for hours.
+    // Moving only the measurement would not have helped: the SSE handler is
+    // what holds the task. Measured after the change: 12 of 12 status
+    // probes answered in 94-193 ms while a calibration was running.
+    expect(webServer).toContain('httpd_req_async_handler_begin');
+    expect(webServer).toContain('httpd_req_async_handler_complete');
+    expect(webServer).toContain('xTaskCreate(calibration_worker');
+    // The handler must not do the work itself any more.
+    for (const name of ['calibration_zero_stream', 'calibration_angle_stream',
+                        'calibration_camera_stream']) {
+      const fn = webServer.slice(webServer.indexOf(`static esp_err_t ${name}(httpd_req_t *req)`));
+      const body = fn.slice(0, fn.indexOf('\n}'));
+      expect(body).toContain('start_calibration(req,');
+      expect(body).not.toContain('httpd_resp_send_chunk');
+    }
+  });
+
+  it('always relinquishes the socket, and refuses a second run', () => {
+    // An async request that is never completed leaves the socket owned
+    // forever; the server then stops accepting connections altogether.
+    const start = webServer.slice(webServer.indexOf('static esp_err_t start_calibration('));
+    const body = start.slice(0, start.indexOf('\n}'));
+    expect(body).toContain('s_calibrationBusy');
+    expect(body).toContain('409 Conflict');
+    // the failure path after a successful begin() must still complete it
+    expect(body).toContain('httpd_req_async_handler_complete(async)');
+    const worker = webServer.slice(webServer.indexOf('static void calibration_worker('));
+    expect(worker.slice(0, worker.indexOf('\n    vTaskDelete'))).toContain('httpd_req_async_handler_complete(req)');
+  });
+
+  it('lets the server reclaim idle sockets, now that a run holds one for half an hour', () => {
+    expect(mainCpp).toContain('lru_purge_enable = true');
+  });
+});
+
 describe('Output-angle calibration firmware contract', () => {
   it('asks an external service for the angle instead of doing vision on the device', () => {
     // The image processing belongs where the image already is. Doing it here

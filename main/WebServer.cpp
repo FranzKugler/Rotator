@@ -11,6 +11,7 @@
 #include "ExpertLock.h"
 #include "RotatorHW.h"
 #include "WebServer.h"
+#include <new>
 #include "WifiManager.h"
 
 static const char *TAG = "webserver";
@@ -470,22 +471,67 @@ static esp_err_t set_camera_source_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/**
- * GET /api/calibration/camera/stream
+/* ---------------------------------------------------------------------------
+ * Calibration runs, off the HTTP server's own task.
  *
- * Runs the camera-referenced output-angle calibration, progress over SSE
- * like the other two. Real motion over the whole travel and several minutes
- * long, so the same client-gone handling applies: the run finishes and
- * persists whatever it measured even if the browser goes away.
- */
-static esp_err_t calibration_camera_stream(httpd_req_t *req)
+ * All three take minutes - the output-angle one takes over half an hour -
+ * and ESP-IDF's httpd serves every socket from a single task. A handler
+ * that streams progress for that long therefore does not just occupy its
+ * own connection: the whole server stops answering, including the status
+ * endpoint that would say what is going on and the Alpaca routes a client
+ * might be using. Live on 2026-09-19 a calibration pointed at an
+ * unreachable angle source took the device off the network entirely for
+ * hours.
+ *
+ * Moving only the measurement to a worker task would not have helped, since
+ * the SSE handler itself is what holds the server task. So the request is
+ * handed over with httpd_req_async_handler_begin(): the handler returns
+ * immediately, the server goes back to its select loop, and the worker owns
+ * the socket until it calls httpd_req_async_handler_complete(). The wire
+ * protocol is unchanged - the browser still sees the same event stream.
+ *
+ * One run at a time, because all three drive the same motor.
+ * ------------------------------------------------------------------------ */
+
+enum class CalibrationKind { Zero, Angle, Camera };
+
+namespace {
+struct CalibrationJob
 {
-    if (!expert_lock_guard(req)) return ESP_FAIL;
+    httpd_req_t *request;
+    CalibrationKind kind;
+};
 
-    httpd_resp_set_type(req, "text/event-stream");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+// Only ever touched from the httpd task (set) and the worker (cleared), and
+// only after the worker has been created, so a plain flag is enough - there
+// is no window in which both write it.
+volatile bool s_calibrationBusy = false;
 
+const char *kind_name(CalibrationKind kind)
+{
+    switch (kind)
+    {
+    case CalibrationKind::Zero:   return "zero";
+    case CalibrationKind::Angle:  return "angle";
+    default:                      return "camera";
+    }
+}
+} // namespace
+
+static void calibration_worker(void *arg)
+{
+    CalibrationJob *job = (CalibrationJob *)arg;
+    httpd_req_t *req = job->request;
+    const CalibrationKind kind = job->kind;
+    delete job;
+
+    // Once the client is gone, httpd_resp_send_chunk() on the dead socket
+    // doesn't just fail quickly - each attempt blocks for a real send
+    // timeout (several hundred ms, live-measured), so a lost browser tab
+    // would turn a calibration into many minutes of retrying sends nobody
+    // reads. The measurement must keep running regardless: its result is
+    // persisted and is still good even if nobody is watching. So this only
+    // stops trying to *send*; it never aborts the run.
     char buf[256];
     bool clientGone = false;
     auto send_event = [&](const char *evt, const char *data)
@@ -495,31 +541,124 @@ static esp_err_t calibration_camera_stream(httpd_req_t *req)
         int len = snprintf(buf, sizeof(buf), "event: %s\ndata: %s\n\n", evt, data);
         if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
         {
-            ESP_LOGW(TAG, "calibration/camera/stream: client gone, continuing");
+            ESP_LOGW(TAG, "calibration/%s/stream: client gone, continuing without further events",
+                     kind_name(kind));
             clientGone = true;
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     };
+    auto progress = [&](int pct)
+    {
+        char d[8];
+        snprintf(d, sizeof(d), "%d", pct);
+        send_event("progress", d);
+    };
 
-    auto result = RotatorHW::getInstance().calibrateOutputAngle(
-        [&](int pct)
-        {
-            char d[8];
-            snprintf(d, sizeof(d), "%d", pct);
-            send_event("progress", d);
-        });
+    auto &rotator = RotatorHW::getInstance();
+    switch (kind)
+    {
+    case CalibrationKind::Zero:
+    {
+        int zero = rotator.measureMechanicalZero(progress);
+        // Persists to NVS (see RotatorHW::setZeroPosSensorValue()) so this
+        // survives a reboot, and takes effect in memory immediately so the
+        // next gotoMechanicalZero() already uses it.
+        rotator.setZeroPosSensorValue(zero);
+        char dv[16];
+        snprintf(dv, sizeof(dv), "%d", zero);
+        send_event("complete_zero", dv);
+        break;
+    }
+    case CalibrationKind::Angle:
+    {
+        auto result = rotator.calibrateAngleSensor(progress);
+        char json[224];
+        snprintf(json, sizeof(json),
+                 "{\"residualBeforeDeg\":%.4f,\"residualAfterDeg\":%.4f,\"peakAfterDeg\":%.4f,"
+                 "\"closureCounts\":%.3f,\"repeatabilityCounts\":%.3f,\"generation\":%lu}",
+                 result.residualBeforeDeg, result.residualAfterDeg, result.peakAfterDeg,
+                 result.closureCounts, result.repeatabilityCounts,
+                 (unsigned long)rotator.getCalibrationStatus().generation);
+        send_event("complete_angle", json);
+        break;
+    }
+    case CalibrationKind::Camera:
+    {
+        auto result = rotator.calibrateOutputAngle(progress);
+        char json[224];
+        snprintf(json, sizeof(json),
+                 "{\"positions\":%d,\"rmsBeforeMdeg\":%.1f,\"peakBeforeMdeg\":%.1f,"
+                 "\"rmsAfterMdeg\":%.1f,\"stored\":%s}",
+                 result.positions, result.rmsBeforeMdeg, result.peakBeforeMdeg,
+                 result.rmsAfterMdeg, result.stored ? "true" : "false");
+        send_event("complete_camera", json);
+        break;
+    }
+    }
 
-    char resultJson[224];
-    snprintf(resultJson, sizeof(resultJson),
-             "{\"positions\":%d,\"rmsBeforeMdeg\":%.1f,\"peakBeforeMdeg\":%.1f,"
-             "\"rmsAfterMdeg\":%.1f,\"stored\":%s}",
-             result.positions, result.rmsBeforeMdeg, result.peakBeforeMdeg,
-             result.rmsAfterMdeg, result.stored ? "true" : "false");
-    send_event("complete_camera", resultJson);
     if (!clientGone)
         httpd_resp_send_chunk(req, nullptr, 0);
+    // Not optional: without this the server eventually stops accepting
+    // connections altogether ("httpd_accept_conn: error in accept (23)").
+    httpd_req_async_handler_complete(req);
+
+    ESP_LOGI(TAG, "calibration/%s finished, worker stack headroom %u bytes",
+             kind_name(kind), (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+    s_calibrationBusy = false;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_calibration(httpd_req_t *req, CalibrationKind kind)
+{
+    if (s_calibrationBusy)
+    {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"error\":\"calibrationBusy\"}");
+    }
+
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+
+    httpd_req_t *async = nullptr;
+    if (httpd_req_async_handler_begin(req, &async) != ESP_OK)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not detach the request");
+        return ESP_FAIL;
+    }
+
+    auto *job = new (std::nothrow) CalibrationJob{async, kind};
+    // 12 KB: the angle fit solves an 11x12 system on the stack and the
+    // camera run carries an esp_http_client with it. Measured rather than
+    // guessed - the worker logs its own high-water mark when it finishes,
+    // and a zero run leaves 9116 bytes of it unused.
+    if (!job || xTaskCreate(calibration_worker, "calib", 12288, job, 4, nullptr) != pdPASS)
+    {
+        delete job;
+        httpd_req_async_handler_complete(async);
+        ESP_LOGE(TAG, "Could not start the calibration worker");
+        return ESP_FAIL;
+    }
+    s_calibrationBusy = true;
     return ESP_OK;
+}
+
+static esp_err_t calibration_zero_stream(httpd_req_t *req)
+{
+    return start_calibration(req, CalibrationKind::Zero);
+}
+
+static esp_err_t calibration_angle_stream(httpd_req_t *req)
+{
+    return start_calibration(req, CalibrationKind::Angle);
+}
+
+static esp_err_t calibration_camera_stream(httpd_req_t *req)
+{
+    if (!expert_lock_guard(req)) return ESP_FAIL;
+    return start_calibration(req, CalibrationKind::Camera);
 }
 
 static esp_err_t calibration_status_handler(httpd_req_t *req)
@@ -700,107 +839,6 @@ static esp_err_t position_goto_handler(httpd_req_t *req)
     int len = snprintf(buf, sizeof(buf), "{\"ok\":%s}", ok ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, len);
-    return ESP_OK;
-}
-
-static esp_err_t calibration_zero_stream(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/event-stream");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
-
-    char buf[64];
-    // Helper, um SSE-Events zu senden und kurz zu yielden. Once the client is
-    // gone, httpd_resp_send_chunk() on the dead socket doesn't just fail
-    // quickly - each attempt blocks for a real send timeout (several hundred
-    // ms, live-measured), so a lost browser tab can turn a ~30s calibration
-    // into many minutes of the httpd worker retrying sends nobody reads. The
-    // underlying measurement must keep running regardless (its NVS result
-    // should still be good even if nobody's watching), so this only stops
-    // trying to *send* once the socket is confirmed dead - it never aborts
-    // the calibration itself.
-    bool clientGone = false;
-    auto send_event = [&](const char *evt, const char *data)
-    {
-        if (clientGone)
-            return;
-        int len = snprintf(buf, sizeof(buf),
-                           "event: %s\ndata: %s\n\n", evt, data);
-        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
-        {
-            ESP_LOGW(TAG, "calibration/zero/stream: client gone, continuing without further progress events");
-            clientGone = true;
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    };
-
-    // Long-running zero measurement mit Progress-Callback
-    int zero = RotatorHW::getInstance().measureMechanicalZero(
-        [&](int pct)
-        {
-            char d[8];
-            snprintf(d, sizeof(d), "%d", pct);
-            send_event("progress", d);
-        });
-    // Persists to NVS (see RotatorHW::setZeroPosSensorValue()) so this
-    // calibration survives a reboot without a firmware rebuild - and takes
-    // effect immediately in memory, so gotoMechanicalZero() uses it on the
-    // very next boot or on-demand /api/debug/goto-mechanical-zero call.
-    RotatorHW::getInstance().setZeroPosSensorValue(zero);
-    char dv[8];
-    snprintf(dv, sizeof(dv), "%d", zero);
-    send_event("complete_zero", dv);
-
-    if (!clientGone)
-        httpd_resp_send_chunk(req, nullptr, 0);
-    return ESP_OK;
-}
-
-static esp_err_t calibration_angle_stream(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/event-stream");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
-
-    char buf[256];
-    // See calibration_zero_stream()'s send_event() - same client-gone/send-
-    // timeout hazard, same fix: stop sending once the socket is dead, but
-    // let the (much longer) angle sweep keep running and persist its result.
-    bool clientGone = false;
-    auto send_event = [&](const char *evt, const char *data)
-    {
-        if (clientGone)
-            return;
-        int len = snprintf(buf, sizeof(buf),
-                           "event: %s\ndata: %s\n\n", evt, data);
-        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK)
-        {
-            ESP_LOGW(TAG, "calibration/angle/stream: client gone, continuing without further progress events");
-            clientGone = true;
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    };
-
-    RotatorHW::CalibrationResult result = RotatorHW::getInstance().calibrateAngleSensor(
-        [&](int pct)
-        {
-            char d[8];
-            snprintf(d, sizeof(d), "%d", pct);
-            send_event("progress", d);
-        });
-    char resultJson[224];
-    snprintf(resultJson, sizeof(resultJson),
-             "{\"residualBeforeDeg\":%.4f,\"residualAfterDeg\":%.4f,\"peakAfterDeg\":%.4f,"
-             "\"closureCounts\":%.3f,\"repeatabilityCounts\":%.3f,\"generation\":%lu}",
-             result.residualBeforeDeg, result.residualAfterDeg, result.peakAfterDeg,
-             result.closureCounts, result.repeatabilityCounts,
-             (unsigned long)RotatorHW::getInstance().getCalibrationStatus().generation);
-    send_event("complete_angle", resultJson);
-
-    if (!clientGone)
-        httpd_resp_send_chunk(req, nullptr, 0);
     return ESP_OK;
 }
 
